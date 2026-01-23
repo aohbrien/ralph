@@ -504,11 +504,8 @@ This signals to Ralph that the story is done and it should move to the next iter
                     time.sleep(self.iteration_delay)
                 continue
 
-            # Check for completion
-            if result.completed:
-                print_completion()
-                clear_state(self.base_dir)
-                return True
+            # Note: result.completed means the story signaled completion with <promise>COMPLETE</promise>
+            # This just means this story is done - we still need to check if ALL stories are done
 
             # Reload PRD to check if all stories are done
             prd = self._load_prd()
