@@ -10,6 +10,7 @@ from rich.console import Console
 
 from ralph import __version__
 from ralph.archive import manual_archive
+from ralph.config import Plan, get_plan, set_plan as config_set_plan
 from ralph.console import (
     print_archive_info,
     print_dry_run_plan,
@@ -17,6 +18,7 @@ from ralph.console import (
     print_info,
     print_init_success,
     print_prd_status,
+    print_success,
     print_task_list,
     print_validation_result,
 )
@@ -544,6 +546,31 @@ def resume(
     else:
         # result is an int (e.g., 130 for SIGINT)
         raise typer.Exit(result)
+
+
+@app.command()
+def usage(
+    set_plan: Optional[str] = typer.Option(
+        None,
+        "--set-plan",
+        help="Set your Claude plan type (free, pro, max5x, max20x)",
+    ),
+) -> None:
+    """Show usage statistics and manage plan configuration."""
+    # Handle --set-plan option
+    if set_plan is not None:
+        try:
+            plan_enum = Plan.from_string(set_plan)
+            config_set_plan(plan_enum)
+            print_success(f"Plan set to: {plan_enum.value}")
+            raise typer.Exit(0)
+        except ValueError as e:
+            print_error(str(e))
+            raise typer.Exit(1)
+
+    # Display current plan
+    current_plan = get_plan()
+    console.print(f"Current plan: [cyan]{current_plan.value}[/cyan]")
 
 
 if __name__ == "__main__":

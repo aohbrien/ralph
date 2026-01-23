@@ -68,6 +68,11 @@ def print_info(message: str) -> None:
     console.print(f"[dim]{message}[/dim]")
 
 
+def print_success(message: str) -> None:
+    """Print a success message."""
+    console.print(f"[bold green]✓[/bold green] {message}")
+
+
 def print_prd_status(prd: PRD) -> None:
     """Print PRD status as a table."""
     completed, total = prd.get_progress()
