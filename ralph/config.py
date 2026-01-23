@@ -111,7 +111,7 @@ class Config:
         if "plan" in data:
             try:
                 plan = Plan.from_string(data["plan"])
-            except ValueError as e:
+            except (ValueError, AttributeError, TypeError) as e:
                 logger.warning(f"Invalid plan in config: {e}. Using default: {DEFAULT_PLAN.value}")
 
         return cls(plan=plan)

@@ -1,0 +1,12 @@
+{"type": "assistant", "timestamp": "2025-01-20T08:00:00Z", "sessionId": "550e8400-e29b-41d4-a716-446655440004", "message": {"model": "claude-sonnet-4-20250514", "usage": {"input_tokens": 1000, "output_tokens": 500, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 50}}}
+this is not valid json at all
+{"type": "assistant", "timestamp": "2025-01-20T08:05:00Z", "sessionId": "550e8400-e29b-41d4-a716-446655440004", "message": {"model": "claude-sonnet-4-20250514", "usage": {"input_tokens": 1500, "output_tokens": 700, "cache_creation_input_tokens": 150, "cache_read_input_tokens": 100}}}
+
+{"incomplete json": "missing closing brace"
+{"type": "user", "timestamp": "2025-01-20T08:10:00Z", "message": {"content": "user message has no usage"}}
+{"type": "assistant", "timestamp": "2025-01-20T08:15:00Z", "sessionId": "550e8400-e29b-41d4-a716-446655440004", "message": {"content": "assistant without usage field"}}
+{"type": "assistant", "timestamp": "2025-01-20T08:20:00Z", "sessionId": "550e8400-e29b-41d4-a716-446655440004", "message": {"model": "claude-sonnet-4-20250514", "usage": {"input_tokens": null, "output_tokens": 600}}}
+{"type": "assistant", "timestamp": "2025-01-20T08:25:00Z", "sessionId": "550e8400-e29b-41d4-a716-446655440004", "message": {"model": "claude-sonnet-4-20250514", "usage": {"input_tokens": "not a number", "output_tokens": 500}}}
+{"type": "assistant", "timestamp": "invalid-timestamp", "sessionId": "550e8400-e29b-41d4-a716-446655440004", "message": {"model": "claude-sonnet-4-20250514", "usage": {"input_tokens": 2000, "output_tokens": 800}}}
+{"type": "assistant", "sessionId": "550e8400-e29b-41d4-a716-446655440004", "message": {"model": "claude-sonnet-4-20250514", "usage": {"input_tokens": 2000, "output_tokens": 800}}}
+{"type": "assistant", "timestamp": "2025-01-20T08:30:00Z", "sessionId": "550e8400-e29b-41d4-a716-446655440004", "message": {"model": "claude-sonnet-4-20250514", "usage": {"input_tokens": 2000, "output_tokens": 1000, "cache_creation_input_tokens": 200, "cache_read_input_tokens": 150}}}
