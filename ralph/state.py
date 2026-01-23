@@ -22,6 +22,7 @@ class RunState:
     last_story_id: str | None
     started_at: str
     updated_at: str
+    story_count: int | None = None
 
     @classmethod
     def create(
@@ -30,6 +31,7 @@ class RunState:
         tool: str,
         iteration: int,
         story_id: str | None,
+        story_count: int | None = None,
     ) -> RunState:
         """Create a new run state."""
         now = datetime.now().isoformat()
@@ -40,6 +42,7 @@ class RunState:
             last_story_id=story_id,
             started_at=now,
             updated_at=now,
+            story_count=story_count,
         )
 
     @classmethod
@@ -52,6 +55,7 @@ class RunState:
             last_story_id=data.get("last_story_id"),
             started_at=data["started_at"],
             updated_at=data["updated_at"],
+            story_count=data.get("story_count"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -63,6 +67,7 @@ class RunState:
             "last_story_id": self.last_story_id,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
+            "story_count": self.story_count,
         }
 
     def update(self, iteration: int, story_id: str | None) -> None:

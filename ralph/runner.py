@@ -25,8 +25,8 @@ from ralph.console import (
     print_warning,
 )
 from ralph.conversation import ConversationWatcher
-from ralph.prd import PRD
-from ralph.process import ManagedProcess, ProcessResult, Tool, run_tool
+from ralph.prd import PRD, UserStory
+from ralph.process import ManagedProcess, ProcessResult, Tool, run_tool_with_prompt
 from ralph.state import RunState, clear_state, load_state, save_state
 from ralph.tasks import get_all_tasks_for_project, ClaudeTask
 
@@ -82,6 +82,61 @@ class Runner:
             return self.base_dir / "CLAUDE.md"
         else:
             return self.base_dir / "prompt.md"
+
+    def _generate_prompt(self, story: UserStory, prd: PRD) -> str:
+        """Generate a dynamic prompt for the current iteration."""
+        # Read the base prompt file (CLAUDE.md or prompt.md) for project context
+        base_context = ""
+        if self.prompt_path.exists():
+            base_context = self.prompt_path.read_text()
+
+        # Format acceptance criteria as a checklist
+        criteria_list = "\n".join(f"- [ ] {c}" for c in story.acceptance_criteria)
+
+        prompt = f"""# Task: Implement User Story {story.id}
+
+## Project Context
+{base_context}
+
+---
+
+## Your Assignment
+
+You are working on the **{prd.project}** project. Your task is to implement the following user story:
+
+### {story.id}: {story.title}
+
+**Description:** {story.description}
+
+**Acceptance Criteria:**
+{criteria_list}
+
+{f"**Notes:** {story.notes}" if story.notes else ""}
+
+## Instructions
+
+1. **Analyze** the codebase to understand the current implementation
+2. **Implement** the changes needed to satisfy ALL acceptance criteria
+3. **Test** your changes to ensure they work correctly
+4. **Update** the prd.json file to set `"passes": true` for story {story.id} once all criteria are met
+5. **Update** progress.txt with a summary of what you did
+
+## Important
+
+- Focus ONLY on this story - do not implement other stories
+- Make sure ALL acceptance criteria are satisfied before marking complete
+- Run `mypy ralph` to ensure type checking passes if the criteria mention it
+- Run `pytest` if tests are part of the acceptance criteria
+
+## Completion Signal
+
+When you have successfully implemented this story AND updated prd.json to mark it as passing, output:
+
+<promise>COMPLETE</promise>
+
+This signals to Ralph that the story is done and it should move to the next iteration.
+"""
+        return prompt
 
     def _get_progress_path(self) -> Path:
         """Get the progress file path."""
@@ -159,7 +214,34 @@ class Runner:
         """Load the PRD from file."""
         return PRD.from_file(self.prd_path)
 
-    def _save_run_state(self, iteration: int, story_id: str | None) -> None:
+    def _validate_prd_for_resume(self, state: RunState, prd: PRD) -> None:
+        """Validate that PRD hasn't changed significantly since the saved state."""
+        # Load the original story count from the state if available
+        # For now, we'll compare based on the path match and warn if story count seems off
+        state_prd_path = Path(state.prd_path).resolve()
+        current_prd_path = self.prd_path.resolve()
+
+        if state_prd_path != current_prd_path:
+            print_warning(
+                f"PRD path differs from saved state.\n"
+                f"  State: {state_prd_path}\n"
+                f"  Current: {current_prd_path}"
+            )
+
+        # Store story count in state for future validation
+        if hasattr(state, "story_count") and state.story_count is not None:
+            current_count = len(prd.user_stories)
+            if current_count != state.story_count:
+                print_warning(
+                    f"PRD story count changed since last run.\n"
+                    f"  Previous: {state.story_count} stories\n"
+                    f"  Current: {current_count} stories\n"
+                    f"  Resume may skip or repeat work."
+                )
+
+    def _save_run_state(
+        self, iteration: int, story_id: str | None, story_count: int | None = None
+    ) -> None:
         """Save run state for resume functionality."""
         if self._run_state is None:
             self._run_state = RunState.create(
@@ -167,6 +249,7 @@ class Runner:
                 tool=self.tool.value,
                 iteration=iteration,
                 story_id=story_id,
+                story_count=story_count,
             )
         else:
             self._run_state.update(iteration, story_id)
@@ -209,25 +292,28 @@ class Runner:
         # Display current tasks if enabled
         self._display_tasks()
 
-        # Check if prompt file exists
-        if not self.prompt_path.exists():
-            print_error(f"Prompt file not found: {self.prompt_path}")
-            return ProcessResult(output="", return_code=1, completed=False), story_id
+        # Check if there's a story to work on
+        if next_story is None:
+            print_info("No incomplete stories found - all done!")
+            return ProcessResult(output="", return_code=0, completed=True), None
+
+        # Generate the dynamic prompt for this story
+        prompt = self._generate_prompt(next_story, prd)
 
         if self.verbose:
-            print_info(f"Running {self.tool.value} with prompt: {self.prompt_path}")
+            print_info(f"Running {self.tool.value} for story: {next_story.id}")
 
         # Start conversation watcher for real-time log display
         watcher = ConversationWatcher(self.base_dir)
         watcher.start()
 
-        # Run the tool
+        # Run the tool with the generated prompt
         self._managed_process.reset()
         output_handler = self._create_output_handler()
         try:
-            result = run_tool(
+            result = run_tool_with_prompt(
                 tool=self.tool,
-                prompt_path=self.prompt_path,
+                prompt=prompt,
                 on_output=output_handler,
                 cwd=self.base_dir,
                 managed_process=self._managed_process,
@@ -272,6 +358,9 @@ class Runner:
         if self.resume:
             existing_state = load_state(self.base_dir)
             if existing_state:
+                # Validate PRD hasn't changed significantly
+                self._validate_prd_for_resume(existing_state, prd)
+
                 # Resume from last completed iteration
                 self._start_iteration = existing_state.last_iteration + 1
                 self._run_state = existing_state
@@ -325,7 +414,8 @@ class Runner:
             self._save_iteration_log(iteration, story_id, result.output)
 
             # Save run state for resume functionality
-            self._save_run_state(iteration, story_id)
+            prd = self._load_prd()
+            self._save_run_state(iteration, story_id, len(prd.user_stories))
 
             # Check for interrupt after iteration
             if self._interrupted or result.interrupted:

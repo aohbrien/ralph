@@ -135,6 +135,26 @@ def run(
         print_dry_run_plan(prd_obj, max_iterations)
         raise typer.Exit(0)
 
+    # Check for existing state and prompt user if not resuming
+    if not resume:
+        existing_state = load_state(prd_path.parent)
+        if existing_state:
+            print_info(
+                f"Found previous run state (iteration {existing_state.last_iteration}, "
+                f"story {existing_state.last_story_id or 'N/A'})"
+            )
+            should_resume = typer.confirm(
+                "Resume from previous run?",
+                default=True,
+            )
+            if should_resume:
+                resume = True
+            else:
+                # Clear the state file to start fresh
+                from ralph.state import clear_state
+                clear_state(prd_path.parent)
+                print_info("Cleared previous state, starting fresh")
+
     # Convert timeout from minutes to seconds (None for 0 = no timeout)
     timeout_seconds: float | None = timeout * 60 if timeout > 0 else None
 
