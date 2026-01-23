@@ -108,6 +108,11 @@ def run(
         "-r",
         help="Resume from last completed iteration",
     ),
+    max_retries: int = typer.Option(
+        2,
+        "--max-retries",
+        help="Per-iteration retry attempts for transient failures (default: 2)",
+    ),
 ) -> None:
     """Run the Ralph autonomous agent loop."""
     # Validate PRD path
@@ -171,6 +176,7 @@ def run(
         timeout=timeout_seconds,
         log_dir=resolved_log_dir,
         resume=resume,
+        max_retries=max_retries,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -478,6 +484,11 @@ def resume(
         "--log-dir",
         help="Directory to save iteration logs (default: logs/)",
     ),
+    max_retries: int = typer.Option(
+        2,
+        "--max-retries",
+        help="Per-iteration retry attempts for transient failures (default: 2)",
+    ),
 ) -> None:
     """Resume a previously interrupted run."""
     # Validate PRD path
@@ -522,6 +533,7 @@ def resume(
         timeout=timeout_seconds,
         log_dir=resolved_log_dir,
         resume=True,
+        max_retries=max_retries,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)

@@ -284,3 +284,32 @@ def print_resume_info(
         title="Resume",
         style="blue",
     ))
+
+
+def print_retry(
+    iteration: int,
+    attempt: int,
+    max_retries: int,
+    return_code: int,
+    backoff_seconds: float,
+) -> None:
+    """Print message when retrying a failed iteration."""
+    console.print()
+    console.print(Panel(
+        f"[bold yellow]Iteration {iteration} failed[/bold yellow] (exit code: {return_code})\n"
+        f"Retry {attempt}/{max_retries} in {backoff_seconds:.0f}s...",
+        title="Retry",
+        style="yellow",
+    ))
+
+
+def print_retry_exhausted(iteration: int, max_retries: int, return_code: int) -> None:
+    """Print message when all retries are exhausted."""
+    console.print()
+    console.print(Panel(
+        f"[bold yellow]Iteration {iteration} failed after {max_retries} retries[/bold yellow]\n"
+        f"Last exit code: {return_code}\n"
+        f"Continuing to next iteration...",
+        title="Retries Exhausted",
+        style="yellow",
+    ))

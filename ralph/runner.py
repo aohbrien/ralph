@@ -20,6 +20,8 @@ from ralph.console import (
     print_max_iterations_reached,
     print_prd_status,
     print_resume_info,
+    print_retry,
+    print_retry_exhausted,
     print_task_list,
     print_timeout,
     print_warning,
@@ -34,6 +36,8 @@ from ralph.tasks import get_all_tasks_for_project, ClaudeTask
 DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_ITERATION_DELAY = 2.0  # seconds
 DEFAULT_TIMEOUT = 30 * 60  # 30 minutes in seconds
+DEFAULT_MAX_RETRIES = 2  # per-iteration retry attempts
+RETRY_BACKOFF_BASE = 5.0  # seconds for first retry (5s, 15s, 45s with multiplier 3)
 
 
 class Runner:
@@ -50,6 +54,7 @@ class Runner:
         timeout: float | None = DEFAULT_TIMEOUT,
         log_dir: Path | None = None,
         resume: bool = False,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ):
         self.prd_path = prd_path
         self.tool = tool
@@ -60,6 +65,7 @@ class Runner:
         self.timeout = timeout
         self.log_dir = log_dir
         self.resume = resume
+        self.max_retries = max_retries
 
         # Derive paths
         self.base_dir = prd_path.parent
@@ -274,6 +280,14 @@ This signals to Ralph that the story is done and it should move to the next iter
         if tasks:
             print_task_list(tasks, "Current Claude Tasks")
 
+    def _calculate_backoff(self, attempt: int) -> float:
+        """Calculate exponential backoff delay for retry attempt.
+
+        Uses formula: base * (3 ^ (attempt - 1))
+        This gives: 5s, 15s, 45s for attempts 1, 2, 3
+        """
+        return float(RETRY_BACKOFF_BASE * (3 ** (attempt - 1)))
+
     def run_iteration(self, iteration: int) -> tuple[ProcessResult, str | None]:
         """
         Run a single iteration.
@@ -329,6 +343,61 @@ This signals to Ralph that the story is done and it should move to the next iter
             if result.completed:
                 print_info("Completion signal detected!")
 
+        return result, story_id
+
+    def _run_iteration_with_retry(
+        self, iteration: int
+    ) -> tuple[ProcessResult, str | None]:
+        """
+        Run a single iteration with retry logic for transient failures.
+
+        Retries on non-zero exit code from Claude, but NOT on timeout.
+        Uses exponential backoff between retries (5s, 15s, 45s).
+
+        Returns:
+            Tuple of (ProcessResult from tool execution, story ID or None)
+        """
+        result, story_id = self.run_iteration(iteration)
+
+        # Don't retry on success, timeout, interrupt, or completion
+        if (
+            result.return_code == 0
+            or result.timed_out
+            or result.interrupted
+            or result.completed
+        ):
+            return result, story_id
+
+        # Retry logic for non-zero exit codes
+        for attempt in range(1, self.max_retries + 1):
+            # Check for interrupt before retrying
+            if self._interrupted:
+                return result, story_id
+
+            backoff = self._calculate_backoff(attempt)
+            print_retry(iteration, attempt, self.max_retries, result.return_code, backoff)
+
+            # Wait with backoff
+            time.sleep(backoff)
+
+            # Check for interrupt after waiting
+            if self._interrupted:
+                return result, story_id
+
+            # Retry the iteration
+            result, story_id = self.run_iteration(iteration)
+
+            # If this attempt succeeded or hit a terminal condition, return
+            if (
+                result.return_code == 0
+                or result.timed_out
+                or result.interrupted
+                or result.completed
+            ):
+                return result, story_id
+
+        # All retries exhausted, log and continue to next iteration
+        print_retry_exhausted(iteration, self.max_retries, result.return_code)
         return result, story_id
 
     def run(self) -> bool | int:
@@ -408,7 +477,8 @@ This signals to Ralph that the story is done and it should move to the next iter
                 print_interrupt(iteration, completed, total)
                 return 130  # Standard exit code for SIGINT
 
-            result, story_id = self.run_iteration(iteration)
+            # Run iteration with retry logic
+            result, story_id = self._run_iteration_with_retry(iteration)
 
             # Save iteration log
             self._save_iteration_log(iteration, story_id, result.output)
@@ -424,7 +494,7 @@ This signals to Ralph that the story is done and it should move to the next iter
                 print_interrupt(iteration, completed, total)
                 return 130  # Standard exit code for SIGINT
 
-            # Check for timeout - log and continue to next iteration
+            # Check for timeout - log and continue to next iteration (no retry on timeout)
             if result.timed_out:
                 print_timeout(iteration)
                 # Continue to next iteration rather than stopping
@@ -467,6 +537,7 @@ def run_ralph(
     timeout: float | None = DEFAULT_TIMEOUT,
     log_dir: Path | None = None,
     resume: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> bool | int:
     """
     Convenience function to run Ralph.
@@ -480,6 +551,7 @@ def run_ralph(
         timeout: Per-iteration timeout in seconds (None = no timeout)
         log_dir: Directory to save iteration logs (None = no logging)
         resume: Resume from previous run state
+        max_retries: Per-iteration retry attempts for transient failures
 
     Returns:
         True if all stories were completed
@@ -496,5 +568,6 @@ def run_ralph(
         timeout=timeout,
         log_dir=log_dir,
         resume=resume,
+        max_retries=max_retries,
     )
     return runner.run()
