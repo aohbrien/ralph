@@ -49,6 +49,42 @@ class Plan(str, Enum):
 # Default plan when not configured
 DEFAULT_PLAN = Plan.PRO
 
+# Plan rate limits (tokens)
+# These are estimates based on publicly available information about Claude plans
+# 5-hour window limits (rolling)
+# Weekly limits (rolling 7-day window)
+PLAN_LIMITS: dict[Plan, dict[str, int]] = {
+    Plan.FREE: {
+        "5hour_tokens": 30_000,  # Free tier has very limited usage
+        "weekly_tokens": 150_000,
+    },
+    Plan.PRO: {
+        "5hour_tokens": 300_000,  # Pro tier baseline
+        "weekly_tokens": 1_500_000,
+    },
+    Plan.MAX5X: {
+        "5hour_tokens": 1_500_000,  # 5x Pro limits
+        "weekly_tokens": 7_500_000,
+    },
+    Plan.MAX20X: {
+        "5hour_tokens": 6_000_000,  # 20x Pro limits
+        "weekly_tokens": 30_000_000,
+    },
+}
+
+
+def get_plan_limits(plan: Plan) -> dict[str, int]:
+    """
+    Get the rate limits for a given plan.
+
+    Args:
+        plan: The Plan enum value
+
+    Returns:
+        Dictionary with '5hour_tokens' and 'weekly_tokens' limits
+    """
+    return PLAN_LIMITS.get(plan, PLAN_LIMITS[DEFAULT_PLAN])
+
 
 @dataclass
 class Config:

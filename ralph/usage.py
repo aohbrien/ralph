@@ -424,3 +424,129 @@ def get_weekly_window_usage(
     records = _filter_by_time_window(records, window_start, window_end)
 
     return _aggregate_records(records, window_start, window_end)
+
+
+@dataclass
+class PreflightCheck:
+    """Result of a pre-flight usage check."""
+
+    current_usage: UsageAggregate
+    limit: int
+    percentage: float
+    estimated_iterations_remaining: int
+    should_warn: bool  # >70% used
+    should_block: bool  # >90% used
+
+    @property
+    def tokens_remaining(self) -> int:
+        """Tokens remaining in the 5-hour window."""
+        return max(0, self.limit - self.current_usage.total_tokens)
+
+
+# Estimated tokens per Ralph iteration
+# Based on typical Claude Code usage patterns
+ESTIMATED_TOKENS_PER_ITERATION = 50_000
+
+
+def check_usage_before_run(
+    claude_dir: Path | None = None,
+    five_hour_limit: int | None = None,
+    now: datetime | None = None,
+) -> PreflightCheck:
+    """
+    Perform a pre-flight usage check before starting a ralph run.
+
+    Checks if there's enough budget remaining in the current 5-hour window.
+
+    Args:
+        claude_dir: Path to Claude projects directory.
+                   Defaults to ~/.claude/projects/
+        five_hour_limit: Token limit for the 5-hour window. If None, uses default pro limit.
+        now: Current time (defaults to datetime.now(timezone.utc))
+
+    Returns:
+        PreflightCheck with usage status and recommendations.
+    """
+    # Get current 5-hour window usage
+    usage = get_5hour_window_usage(claude_dir=claude_dir, now=now)
+
+    # Use provided limit or default to a reasonable pro-tier limit
+    if five_hour_limit is None:
+        five_hour_limit = 300_000  # Pro tier default
+
+    # Calculate percentage used
+    percentage = (usage.total_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
+
+    # Calculate estimated iterations remaining
+    tokens_remaining = max(0, five_hour_limit - usage.total_tokens)
+    estimated_iterations = int(tokens_remaining / ESTIMATED_TOKENS_PER_ITERATION)
+
+    # Determine warning and blocking thresholds
+    should_warn = percentage > 70
+    should_block = percentage > 90
+
+    return PreflightCheck(
+        current_usage=usage,
+        limit=five_hour_limit,
+        percentage=percentage,
+        estimated_iterations_remaining=estimated_iterations,
+        should_warn=should_warn,
+        should_block=should_block,
+    )
+
+
+def get_historical_5hour_windows(
+    days: int,
+    claude_dir: Path | None = None,
+    model_filter: str | None = None,
+    now: datetime | None = None,
+) -> list[UsageAggregate]:
+    """
+    Get historical usage data broken into 5-hour windows.
+
+    Args:
+        days: Number of days to look back
+        claude_dir: Path to Claude projects directory.
+                   Defaults to ~/.claude/projects/
+        model_filter: Filter by model - "opus", "sonnet", or None for all
+        now: Current time (defaults to datetime.now(timezone.utc))
+
+    Returns:
+        List of UsageAggregate objects, one per 5-hour window,
+        sorted chronologically (oldest first).
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # Calculate the start of our historical period
+    period_start = now - timedelta(days=days)
+
+    # Parse all records for the period
+    records = parse_all_sessions(claude_dir, since=period_start)
+
+    # Filter by model if specified
+    records = _filter_by_model(records, model_filter)
+
+    # Generate 5-hour windows
+    windows: list[UsageAggregate] = []
+    window_duration = timedelta(hours=5)
+
+    # Start from the beginning of the period and create windows
+    current_window_start = period_start
+    while current_window_start < now:
+        window_end = current_window_start + window_duration
+
+        # Don't extend past 'now'
+        if window_end > now:
+            window_end = now
+
+        # Get records for this window
+        window_records = _filter_by_time_window(records, current_window_start, window_end)
+
+        # Create aggregate for this window
+        aggregate = _aggregate_records(window_records, current_window_start, window_end)
+        windows.append(aggregate)
+
+        current_window_start = window_end
+
+    return windows

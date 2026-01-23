@@ -10,7 +10,7 @@ from rich.console import Console
 
 from ralph import __version__
 from ralph.archive import manual_archive
-from ralph.config import Plan, get_plan, set_plan as config_set_plan
+from ralph.config import Plan, get_plan, get_plan_limits, set_plan as config_set_plan
 from ralph.console import (
     print_archive_info,
     print_dry_run_plan,
@@ -18,8 +18,13 @@ from ralph.console import (
     print_info,
     print_init_success,
     print_prd_status,
+    print_preflight_blocked,
+    print_preflight_ok,
+    print_preflight_warning,
     print_success,
     print_task_list,
+    print_usage_display,
+    print_usage_history,
     print_validation_result,
 )
 from ralph.prd import PRD, validate_prd_file
@@ -115,8 +120,40 @@ def run(
         "--max-retries",
         help="Per-iteration retry attempts for transient failures (default: 2)",
     ),
+    strict: bool = typer.Option(
+        False,
+        "--strict",
+        help="Block run if >90% of 5-hour window budget is used",
+    ),
+    ignore_limits: bool = typer.Option(
+        False,
+        "--ignore-limits",
+        help="Override usage limit warnings and blocking",
+    ),
+    no_adaptive_pacing: bool = typer.Option(
+        False,
+        "--no-adaptive-pacing",
+        help="Disable adaptive pacing based on usage",
+    ),
+    pacing_threshold_1: float = typer.Option(
+        70.0,
+        "--pacing-t1",
+        help="Usage %% threshold for 2x delay (default: 70)",
+    ),
+    pacing_threshold_2: float = typer.Option(
+        80.0,
+        "--pacing-t2",
+        help="Usage %% threshold for 4x delay (default: 80)",
+    ),
+    pacing_threshold_3: float = typer.Option(
+        90.0,
+        "--pacing-t3",
+        help="Usage %% threshold for 8x delay (default: 90)",
+    ),
 ) -> None:
     """Run the Ralph autonomous agent loop."""
+    from ralph.usage import check_usage_before_run
+
     # Validate PRD path
     prd_path = prd.resolve()
     if not prd_path.exists():
@@ -136,6 +173,37 @@ def run(
     except Exception as e:
         print_error(f"Failed to parse PRD: {e}")
         raise typer.Exit(1)
+
+    # Get plan limits (needed for both pre-flight check and adaptive pacing)
+    current_plan = get_plan()
+    limits = get_plan_limits(current_plan)
+
+    # Pre-flight usage check (unless ignored)
+    if not ignore_limits:
+        preflight = check_usage_before_run(five_hour_limit=limits["5hour_tokens"])
+
+        if preflight.should_block and strict:
+            # Block the run if >90% used and --strict is enabled
+            print_preflight_blocked(
+                percentage=preflight.percentage,
+                tokens_remaining=preflight.tokens_remaining,
+                estimated_iterations=preflight.estimated_iterations_remaining,
+            )
+            raise typer.Exit(1)
+        elif preflight.should_warn:
+            # Warn if >70% used (but don't block without --strict)
+            print_preflight_warning(
+                percentage=preflight.percentage,
+                tokens_remaining=preflight.tokens_remaining,
+                estimated_iterations=preflight.estimated_iterations_remaining,
+            )
+        elif verbose:
+            # Show pre-flight status in verbose mode
+            print_preflight_ok(
+                percentage=preflight.percentage,
+                tokens_remaining=preflight.tokens_remaining,
+                estimated_iterations=preflight.estimated_iterations_remaining,
+            )
 
     # Dry run mode
     if dry_run:
@@ -168,6 +236,9 @@ def run(
     # Resolve log directory (default to logs/ in PRD directory)
     resolved_log_dir = log_dir if log_dir else prd_path.parent / "logs"
 
+    # Get plan limit for adaptive pacing (always use the limit, even if ignore_limits)
+    five_hour_limit_value = limits["5hour_tokens"]
+
     # Run the main loop
     result = run_ralph(
         prd_path=prd_path,
@@ -179,6 +250,11 @@ def run(
         log_dir=resolved_log_dir,
         resume=resume,
         max_retries=max_retries,
+        adaptive_pacing=not no_adaptive_pacing,
+        pacing_threshold_1=pacing_threshold_1,
+        pacing_threshold_2=pacing_threshold_2,
+        pacing_threshold_3=pacing_threshold_3,
+        five_hour_limit=five_hour_limit_value,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -491,6 +567,26 @@ def resume(
         "--max-retries",
         help="Per-iteration retry attempts for transient failures (default: 2)",
     ),
+    no_adaptive_pacing: bool = typer.Option(
+        False,
+        "--no-adaptive-pacing",
+        help="Disable adaptive pacing based on usage",
+    ),
+    pacing_threshold_1: float = typer.Option(
+        70.0,
+        "--pacing-t1",
+        help="Usage %% threshold for 2x delay (default: 70)",
+    ),
+    pacing_threshold_2: float = typer.Option(
+        80.0,
+        "--pacing-t2",
+        help="Usage %% threshold for 4x delay (default: 80)",
+    ),
+    pacing_threshold_3: float = typer.Option(
+        90.0,
+        "--pacing-t3",
+        help="Usage %% threshold for 8x delay (default: 90)",
+    ),
 ) -> None:
     """Resume a previously interrupted run."""
     # Validate PRD path
@@ -525,6 +621,11 @@ def resume(
     # Resolve log directory (default to logs/ in PRD directory)
     resolved_log_dir = log_dir if log_dir else prd_path.parent / "logs"
 
+    # Get plan limits for adaptive pacing
+    current_plan = get_plan()
+    limits = get_plan_limits(current_plan)
+    five_hour_limit_value = limits["5hour_tokens"]
+
     # Run the main loop with resume=True
     result = run_ralph(
         prd_path=prd_path,
@@ -536,6 +637,11 @@ def resume(
         log_dir=resolved_log_dir,
         resume=True,
         max_retries=max_retries,
+        adaptive_pacing=not no_adaptive_pacing,
+        pacing_threshold_1=pacing_threshold_1,
+        pacing_threshold_2=pacing_threshold_2,
+        pacing_threshold_3=pacing_threshold_3,
+        five_hour_limit=five_hour_limit_value,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -555,8 +661,22 @@ def usage(
         "--set-plan",
         help="Set your Claude plan type (free, pro, max5x, max20x)",
     ),
+    history: Optional[int] = typer.Option(
+        None,
+        "--history",
+        "-h",
+        help="Show historical usage over past N days with 5-hour windows",
+    ),
 ) -> None:
     """Show usage statistics and manage plan configuration."""
+    from ralph.usage import (
+        get_5hour_window_usage,
+        get_historical_5hour_windows,
+        get_weekly_window_usage,
+        parse_all_sessions,
+    )
+    from datetime import timedelta, timezone, datetime
+
     # Handle --set-plan option
     if set_plan is not None:
         try:
@@ -568,9 +688,46 @@ def usage(
             print_error(str(e))
             raise typer.Exit(1)
 
-    # Display current plan
+    # Get current plan and its limits
     current_plan = get_plan()
-    console.print(f"Current plan: [cyan]{current_plan.value}[/cyan]")
+    limits = get_plan_limits(current_plan)
+
+    # Handle --history option
+    if history is not None:
+        if history < 1:
+            print_error("History days must be at least 1")
+            raise typer.Exit(1)
+
+        windows = get_historical_5hour_windows(days=history)
+        print_usage_history(
+            windows=windows,
+            five_hour_limit=limits["5hour_tokens"],
+            days=history,
+        )
+        raise typer.Exit(0)
+
+    # Get usage data
+    five_hour_usage = get_5hour_window_usage()
+    weekly_usage = get_weekly_window_usage()
+
+    # Calculate tokens by model for the weekly window (larger window for breakdown)
+    now = datetime.now(timezone.utc)
+    week_ago = now - timedelta(days=7)
+    all_records = parse_all_sessions(since=week_ago)
+
+    opus_tokens = sum(r.total_tokens for r in all_records if r.is_opus)
+    sonnet_tokens = sum(r.total_tokens for r in all_records if r.is_sonnet)
+
+    # Display the usage information
+    print_usage_display(
+        plan=current_plan,
+        five_hour_usage=five_hour_usage,
+        weekly_usage=weekly_usage,
+        five_hour_limit=limits["5hour_tokens"],
+        weekly_limit=limits["weekly_tokens"],
+        opus_tokens=opus_tokens,
+        sonnet_tokens=sonnet_tokens,
+    )
 
 
 if __name__ == "__main__":

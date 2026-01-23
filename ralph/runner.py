@@ -17,18 +17,23 @@ from ralph.console import (
     print_info,
     print_interrupt,
     print_iteration_header,
+    print_iteration_usage,
     print_max_iterations_reached,
+    print_pacing_adjustment,
     print_prd_status,
     print_resume_info,
     print_retry,
     print_retry_exhausted,
     print_task_list,
     print_timeout,
+    print_usage_critical,
+    print_usage_warning,
     print_warning,
 )
 from ralph.conversation import ConversationWatcher
 from ralph.prd import PRD, UserStory
 from ralph.process import ManagedProcess, ProcessResult, Tool, run_tool_with_prompt
+from ralph.session import SessionManager, get_budget_for_session, update_heartbeat
 from ralph.state import RunState, clear_state, load_state, save_state
 from ralph.tasks import get_all_tasks_for_project, ClaudeTask
 
@@ -38,6 +43,14 @@ DEFAULT_ITERATION_DELAY = 2.0  # seconds
 DEFAULT_TIMEOUT = 30 * 60  # 30 minutes in seconds
 DEFAULT_MAX_RETRIES = 2  # per-iteration retry attempts
 RETRY_BACKOFF_BASE = 5.0  # seconds for first retry (5s, 15s, 45s with multiplier 3)
+
+# Adaptive pacing thresholds and multipliers
+DEFAULT_PACING_THRESHOLD_1 = 70.0  # 70% usage - 2x delay
+DEFAULT_PACING_THRESHOLD_2 = 80.0  # 80% usage - 4x delay
+DEFAULT_PACING_THRESHOLD_3 = 90.0  # 90% usage - 8x delay
+DEFAULT_PACING_MULTIPLIER_1 = 2.0
+DEFAULT_PACING_MULTIPLIER_2 = 4.0
+DEFAULT_PACING_MULTIPLIER_3 = 8.0
 
 
 class Runner:
@@ -55,6 +68,11 @@ class Runner:
         log_dir: Path | None = None,
         resume: bool = False,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        adaptive_pacing: bool = True,
+        pacing_threshold_1: float = DEFAULT_PACING_THRESHOLD_1,
+        pacing_threshold_2: float = DEFAULT_PACING_THRESHOLD_2,
+        pacing_threshold_3: float = DEFAULT_PACING_THRESHOLD_3,
+        five_hour_limit: int | None = None,
     ):
         self.prd_path = prd_path
         self.tool = tool
@@ -66,6 +84,16 @@ class Runner:
         self.log_dir = log_dir
         self.resume = resume
         self.max_retries = max_retries
+
+        # Adaptive pacing configuration
+        self.adaptive_pacing = adaptive_pacing
+        self.pacing_threshold_1 = pacing_threshold_1
+        self.pacing_threshold_2 = pacing_threshold_2
+        self.pacing_threshold_3 = pacing_threshold_3
+        self.five_hour_limit = five_hour_limit
+
+        # Track last pacing multiplier to only log changes
+        self._last_pacing_multiplier: float = 1.0
 
         # Derive paths
         self.base_dir = prd_path.parent
@@ -288,6 +316,157 @@ This signals to Ralph that the story is done and it should move to the next iter
         """
         return float(RETRY_BACKOFF_BASE * (3 ** (attempt - 1)))
 
+    def _get_usage_percentage(self) -> float | None:
+        """
+        Get the current 5-hour window usage percentage.
+
+        When cross-session coordination is enabled, this calculates the
+        percentage based on this session's share of the remaining budget.
+
+        Returns:
+            Usage percentage (0-100), or None if usage tracking is unavailable.
+        """
+        try:
+            from ralph.config import get_plan, get_plan_limits
+            from ralph.usage import get_5hour_window_usage
+
+            # Get the limit to use
+            if self.five_hour_limit is not None:
+                limit = self.five_hour_limit
+            else:
+                current_plan = get_plan()
+                limits = get_plan_limits(current_plan)
+                limit = limits["5hour_tokens"]
+
+            if limit <= 0:
+                return None
+
+            usage = get_5hour_window_usage()
+            total_used = usage.total_tokens
+
+            # Calculate remaining budget and divide across active sessions
+            remaining = max(0, limit - total_used)
+            session_budget, num_sessions = get_budget_for_session(remaining)
+
+            # Calculate this session's effective limit (used + session share of remaining)
+            # This ensures each session sees their fair share of the remaining budget
+            effective_limit = total_used + session_budget
+
+            if effective_limit <= 0:
+                return 100.0  # Fully used
+
+            # Calculate percentage based on effective limit
+            percentage = (total_used / effective_limit) * 100
+            return min(percentage, 100.0)
+        except Exception:
+            # If usage tracking fails, don't block the run
+            return None
+
+    def _calculate_adaptive_delay(self, usage_percentage: float | None) -> tuple[float, float]:
+        """
+        Calculate the adaptive iteration delay based on usage percentage.
+
+        Args:
+            usage_percentage: Current usage percentage (0-100), or None
+
+        Returns:
+            Tuple of (adjusted delay in seconds, multiplier applied)
+        """
+        if usage_percentage is None or not self.adaptive_pacing:
+            return self.iteration_delay, 1.0
+
+        # Determine multiplier based on thresholds
+        if usage_percentage >= self.pacing_threshold_3:
+            multiplier = DEFAULT_PACING_MULTIPLIER_3
+        elif usage_percentage >= self.pacing_threshold_2:
+            multiplier = DEFAULT_PACING_MULTIPLIER_2
+        elif usage_percentage >= self.pacing_threshold_1:
+            multiplier = DEFAULT_PACING_MULTIPLIER_1
+        else:
+            multiplier = 1.0
+
+        adjusted_delay = self.iteration_delay * multiplier
+        return adjusted_delay, multiplier
+
+    def _apply_adaptive_pacing(self) -> float:
+        """
+        Check usage and apply adaptive pacing if needed.
+
+        Returns:
+            The delay to use (either base delay or adjusted delay).
+        """
+        usage_percentage = self._get_usage_percentage()
+        adjusted_delay, multiplier = self._calculate_adaptive_delay(usage_percentage)
+
+        # Only log when multiplier changes (to avoid spamming logs)
+        if multiplier != self._last_pacing_multiplier and multiplier > 1.0:
+            if usage_percentage is not None:
+                print_pacing_adjustment(
+                    usage_percentage=usage_percentage,
+                    base_delay=self.iteration_delay,
+                    adjusted_delay=adjusted_delay,
+                    multiplier=multiplier,
+                )
+            self._last_pacing_multiplier = multiplier
+        elif multiplier < self._last_pacing_multiplier:
+            # Usage has decreased, reset tracking
+            if self.verbose and usage_percentage is not None:
+                print_info(f"Usage at {usage_percentage:.1f}%, returning to normal pacing")
+            self._last_pacing_multiplier = multiplier
+
+        return adjusted_delay
+
+    def _display_iteration_usage(self) -> None:
+        """
+        Display current usage after each iteration and show warnings if thresholds exceeded.
+
+        Shows:
+        - Brief usage summary after every iteration
+        - Warning banner at 70% usage
+        - Critical warning banner at 90% usage
+        - Time until window resets in warnings
+        """
+        try:
+            from datetime import timedelta
+
+            from ralph.config import get_plan, get_plan_limits
+            from ralph.console import _format_time_remaining
+            from ralph.usage import get_5hour_window_usage
+
+            # Get the limit to use
+            if self.five_hour_limit is not None:
+                limit = self.five_hour_limit
+            else:
+                current_plan = get_plan()
+                limits = get_plan_limits(current_plan)
+                limit = limits["5hour_tokens"]
+
+            if limit <= 0:
+                return
+
+            usage = get_5hour_window_usage()
+            total_used = usage.total_tokens
+            percentage = (total_used / limit * 100) if limit > 0 else 0
+
+            # Always display brief usage summary after each iteration
+            print_iteration_usage(percentage, total_used, limit)
+
+            # Calculate time until window resets (for rolling windows, oldest data ages out)
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc)
+            time_until_reset = _format_time_remaining(now + timedelta(hours=5), now)
+
+            # Show warning banners based on thresholds
+            if percentage >= 90:
+                print_usage_critical(percentage, total_used, limit, time_until_reset)
+            elif percentage >= 70:
+                print_usage_warning(percentage, total_used, limit, time_until_reset)
+
+        except Exception:
+            # If usage tracking fails, don't block the run
+            pass
+
     def run_iteration(self, iteration: int) -> tuple[ProcessResult, str | None]:
         """
         Run a single iteration.
@@ -414,7 +593,12 @@ This signals to Ralph that the story is done and it should move to the next iter
         self._install_signal_handlers()
 
         try:
-            return self._run_loop()
+            # Use SessionManager for cross-session coordination
+            # This registers our session and automatically cleans up on exit
+            with SessionManager(prd_path=self.prd_path) as session:
+                if self.verbose:
+                    print_info(f"Registered session (PID={session.pid})")
+                return self._run_loop()
         finally:
             self._restore_signal_handlers()
 
@@ -487,6 +671,9 @@ This signals to Ralph that the story is done and it should move to the next iter
             prd = self._load_prd()
             self._save_run_state(iteration, story_id, len(prd.user_stories))
 
+            # Display current usage after each iteration (with warnings if thresholds exceeded)
+            self._display_iteration_usage()
+
             # Check for interrupt after iteration
             if self._interrupted or result.interrupted:
                 prd = self._load_prd()
@@ -499,9 +686,12 @@ This signals to Ralph that the story is done and it should move to the next iter
                 print_timeout(iteration)
                 # Continue to next iteration rather than stopping
                 if iteration < self.max_iterations:
+                    delay = self._apply_adaptive_pacing()
                     if self.verbose:
-                        print_info(f"Waiting {self.iteration_delay}s before next iteration...")
-                    time.sleep(self.iteration_delay)
+                        print_info(f"Waiting {delay:.1f}s before next iteration...")
+                    time.sleep(delay)
+                    # Update session heartbeat during delay
+                    update_heartbeat()
                 continue
 
             # Note: result.completed means the story signaled completion with <promise>COMPLETE</promise>
@@ -516,9 +706,12 @@ This signals to Ralph that the story is done and it should move to the next iter
 
             # Wait before next iteration (unless this was the last one)
             if iteration < self.max_iterations:
+                delay = self._apply_adaptive_pacing()
                 if self.verbose:
-                    print_info(f"Waiting {self.iteration_delay}s before next iteration...")
-                time.sleep(self.iteration_delay)
+                    print_info(f"Waiting {delay:.1f}s before next iteration...")
+                time.sleep(delay)
+                # Update session heartbeat during delay
+                update_heartbeat()
 
         # Max iterations reached without completion
         print_max_iterations_reached(self.max_iterations)
@@ -535,6 +728,11 @@ def run_ralph(
     log_dir: Path | None = None,
     resume: bool = False,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    adaptive_pacing: bool = True,
+    pacing_threshold_1: float = DEFAULT_PACING_THRESHOLD_1,
+    pacing_threshold_2: float = DEFAULT_PACING_THRESHOLD_2,
+    pacing_threshold_3: float = DEFAULT_PACING_THRESHOLD_3,
+    five_hour_limit: int | None = None,
 ) -> bool | int:
     """
     Convenience function to run Ralph.
@@ -549,6 +747,11 @@ def run_ralph(
         log_dir: Directory to save iteration logs (None = no logging)
         resume: Resume from previous run state
         max_retries: Per-iteration retry attempts for transient failures
+        adaptive_pacing: Enable adaptive pacing based on usage
+        pacing_threshold_1: Usage % for 2x delay (default: 70)
+        pacing_threshold_2: Usage % for 4x delay (default: 80)
+        pacing_threshold_3: Usage % for 8x delay (default: 90)
+        five_hour_limit: Override 5-hour token limit (None = use plan limit)
 
     Returns:
         True if all stories were completed
@@ -566,5 +769,10 @@ def run_ralph(
         log_dir=log_dir,
         resume=resume,
         max_retries=max_retries,
+        adaptive_pacing=adaptive_pacing,
+        pacing_threshold_1=pacing_threshold_1,
+        pacing_threshold_2=pacing_threshold_2,
+        pacing_threshold_3=pacing_threshold_3,
+        five_hour_limit=five_hour_limit,
     )
     return runner.run()
