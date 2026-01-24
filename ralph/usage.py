@@ -26,6 +26,7 @@ class UsageRecord:
     cache_read_input_tokens: int
     model: str | None = None
     session_id: str | None = None
+    cost_usd: float = 0.0
 
     @property
     def total_input_tokens(self) -> int:
@@ -156,6 +157,17 @@ def _parse_usage_from_line(line: str, session_id: str | None = None) -> UsageRec
     if session_id is None:
         session_id = data.get("sessionId")
 
+    # Calculate cost for this record
+    from ralph.pricing import calculate_cost
+
+    cost_usd = calculate_cost(
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_creation_tokens=cache_creation,
+        cache_read_tokens=cache_read,
+    )
+
     return UsageRecord(
         timestamp=timestamp,
         input_tokens=input_tokens,
@@ -164,6 +176,7 @@ def _parse_usage_from_line(line: str, session_id: str | None = None) -> UsageRec
         cache_read_input_tokens=cache_read,
         model=model,
         session_id=session_id,
+        cost_usd=cost_usd,
     )
 
 
@@ -242,6 +255,7 @@ class UsageAggregate:
     cache_read_input_tokens: int
     message_count: int
     request_count: int
+    cost_usd: float = 0.0
 
     @property
     def total_input_tokens(self) -> int:
@@ -278,12 +292,14 @@ def _aggregate_records(
     output_tokens = 0
     cache_creation = 0
     cache_read = 0
+    cost_usd = 0.0
 
     for record in records:
         input_tokens += record.input_tokens
         output_tokens += record.output_tokens
         cache_creation += record.cache_creation_input_tokens
         cache_read += record.cache_read_input_tokens
+        cost_usd += record.cost_usd
 
     # Each record is one message/request
     message_count = len(records)
@@ -298,6 +314,7 @@ def _aggregate_records(
         cache_read_input_tokens=cache_read,
         message_count=message_count,
         request_count=request_count,
+        cost_usd=cost_usd,
     )
 
 

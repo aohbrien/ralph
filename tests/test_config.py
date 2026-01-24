@@ -26,6 +26,7 @@ from ralph.config import (
     DEFAULT_PLAN,
     PLAN_LIMITS,
     Config,
+    LimitMode,
     Plan,
     _ensure_config_dir,
     get_plan,
@@ -119,7 +120,10 @@ class TestConfigDataclass:
         config = Config(plan=Plan.MAX5X)
         result = config.to_dict()
 
-        assert result == {"plan": "max5x"}
+        assert result["plan"] == "max5x"
+        assert result["limit_mode"] == "plan"
+        assert result["enable_cost_tracking"] is True
+        assert result["p90_lookback_days"] == 14
 
     def test_to_dict_with_all_plans(self):
         """Test to_dict with all plan types."""
@@ -198,7 +202,10 @@ class TestSaveConfig:
             with open(config_file) as f:
                 data = json.load(f)
 
-            assert data == {"plan": "max5x"}
+            assert data["plan"] == "max5x"
+            assert data["limit_mode"] == "plan"
+            assert data["enable_cost_tracking"] is True
+            assert data["p90_lookback_days"] == 14
 
     def test_save_config_all_plan_types(self):
         """Test saving all plan types."""
@@ -742,3 +749,66 @@ class TestGetAndSetPlan:
                 with open(default_file) as f:
                     data = json.load(f)
                 assert data["plan"] == "max20x"
+                # Check that other config fields are also present
+                assert "limit_mode" in data
+
+
+class TestLimitModeConfig:
+    """Tests for LimitMode configuration."""
+
+    def test_limit_mode_values(self):
+        """Test that all expected limit mode values exist."""
+        assert LimitMode.PLAN.value == "plan"
+        assert LimitMode.P90.value == "p90"
+        assert LimitMode.HYBRID.value == "hybrid"
+
+    def test_config_default_limit_mode(self):
+        """Test that Config has correct default limit mode."""
+        config = Config()
+        assert config.limit_mode == LimitMode.PLAN
+
+    def test_config_from_dict_limit_mode(self):
+        """Test creating Config with limit_mode from dictionary."""
+        data = {"plan": "pro", "limit_mode": "p90"}
+        config = Config.from_dict(data)
+        assert config.limit_mode == LimitMode.P90
+
+    def test_config_from_dict_invalid_limit_mode_uses_default(self):
+        """Test that invalid limit_mode uses default."""
+        data = {"plan": "pro", "limit_mode": "invalid"}
+        config = Config.from_dict(data)
+        assert config.limit_mode == LimitMode.PLAN
+
+    def test_config_round_trip_limit_mode(self):
+        """Test that limit_mode survives round-trip."""
+        for mode in LimitMode:
+            original = Config(plan=Plan.PRO, limit_mode=mode)
+            data = original.to_dict()
+            restored = Config.from_dict(data)
+            assert restored.limit_mode == original.limit_mode
+
+
+class TestCostTrackingConfig:
+    """Tests for cost tracking configuration."""
+
+    def test_config_default_enable_cost_tracking(self):
+        """Test that Config defaults to cost tracking enabled."""
+        config = Config()
+        assert config.enable_cost_tracking is True
+
+    def test_config_from_dict_cost_tracking_disabled(self):
+        """Test loading config with cost tracking disabled."""
+        data = {"plan": "pro", "enable_cost_tracking": False}
+        config = Config.from_dict(data)
+        assert config.enable_cost_tracking is False
+
+    def test_config_default_p90_lookback_days(self):
+        """Test that Config defaults to 14 lookback days."""
+        config = Config()
+        assert config.p90_lookback_days == 14
+
+    def test_config_from_dict_custom_lookback_days(self):
+        """Test loading config with custom lookback days."""
+        data = {"plan": "pro", "p90_lookback_days": 7}
+        config = Config.from_dict(data)
+        assert config.p90_lookback_days == 7

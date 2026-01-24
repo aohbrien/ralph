@@ -10,7 +10,14 @@ from rich.console import Console
 
 from ralph import __version__
 from ralph.archive import manual_archive
-from ralph.config import Plan, get_plan, get_plan_limits, set_plan as config_set_plan
+from ralph.config import (
+    LimitMode,
+    Plan,
+    get_effective_limit,
+    get_plan,
+    get_plan_limits,
+    set_plan as config_set_plan,
+)
 from ralph.console import (
     print_archive_info,
     print_dry_run_plan,
@@ -150,6 +157,16 @@ def run(
         "--pacing-t3",
         help="Usage %% threshold for 8x delay (default: 90)",
     ),
+    limit_mode: str = typer.Option(
+        "plan",
+        "--limit-mode",
+        help="Limit detection mode: plan, p90, or hybrid",
+    ),
+    cost_tracking: bool = typer.Option(
+        True,
+        "--cost-tracking/--no-cost-tracking",
+        help="Enable/disable cost tracking display",
+    ),
 ) -> None:
     """Run the Ralph autonomous agent loop."""
     from ralph.usage import check_usage_before_run
@@ -174,9 +191,16 @@ def run(
         print_error(f"Failed to parse PRD: {e}")
         raise typer.Exit(1)
 
-    # Get plan limits (needed for both pre-flight check and adaptive pacing)
+    # Parse limit mode
+    try:
+        limit_mode_enum = LimitMode(limit_mode.lower())
+    except ValueError:
+        print_error(f"Invalid limit mode: {limit_mode}. Must be 'plan', 'p90', or 'hybrid'")
+        raise typer.Exit(1)
+
+    # Get plan limits based on limit mode
     current_plan = get_plan()
-    limits = get_plan_limits(current_plan)
+    limits = get_effective_limit(plan=current_plan, limit_mode=limit_mode_enum)
 
     # Pre-flight usage check (unless ignored)
     if not ignore_limits:
@@ -587,6 +611,11 @@ def resume(
         "--pacing-t3",
         help="Usage %% threshold for 8x delay (default: 90)",
     ),
+    limit_mode: str = typer.Option(
+        "plan",
+        "--limit-mode",
+        help="Limit detection mode: plan, p90, or hybrid",
+    ),
 ) -> None:
     """Resume a previously interrupted run."""
     # Validate PRD path
@@ -608,6 +637,13 @@ def resume(
         print_error(f"Invalid tool: {tool}. Must be 'claude' or 'amp'")
         raise typer.Exit(1)
 
+    # Parse limit mode
+    try:
+        limit_mode_enum = LimitMode(limit_mode.lower())
+    except ValueError:
+        print_error(f"Invalid limit mode: {limit_mode}. Must be 'plan', 'p90', or 'hybrid'")
+        raise typer.Exit(1)
+
     # Load PRD
     try:
         prd_obj = PRD.from_file(prd_path)
@@ -621,9 +657,9 @@ def resume(
     # Resolve log directory (default to logs/ in PRD directory)
     resolved_log_dir = log_dir if log_dir else prd_path.parent / "logs"
 
-    # Get plan limits for adaptive pacing
+    # Get plan limits based on limit mode
     current_plan = get_plan()
-    limits = get_plan_limits(current_plan)
+    limits = get_effective_limit(plan=current_plan, limit_mode=limit_mode_enum)
     five_hour_limit_value = limits["5hour_tokens"]
 
     # Run the main loop with resume=True
@@ -667,6 +703,16 @@ def usage(
         "-h",
         help="Show historical usage over past N days with 5-hour windows",
     ),
+    show_p90: bool = typer.Option(
+        False,
+        "--p90",
+        help="Show P90-calculated limit based on usage history",
+    ),
+    no_costs: bool = typer.Option(
+        False,
+        "--no-costs",
+        help="Hide cost information in display",
+    ),
 ) -> None:
     """Show usage statistics and manage plan configuration."""
     from ralph.usage import (
@@ -692,6 +738,14 @@ def usage(
     current_plan = get_plan()
     limits = get_plan_limits(current_plan)
 
+    # Get P90 limit if requested
+    p90_limit = None
+    if show_p90:
+        from ralph.p90 import get_p90_limit
+        p90_limit = get_p90_limit()
+        if p90_limit is None:
+            print_info("Insufficient data for P90 calculation")
+
     # Handle --history option
     if history is not None:
         if history < 1:
@@ -703,6 +757,7 @@ def usage(
             windows=windows,
             five_hour_limit=limits["5hour_tokens"],
             days=history,
+            show_costs=not no_costs,
         )
         raise typer.Exit(0)
 
@@ -727,6 +782,8 @@ def usage(
         weekly_limit=limits["weekly_tokens"],
         opus_tokens=opus_tokens,
         sonnet_tokens=sonnet_tokens,
+        show_costs=not no_costs,
+        p90_limit=p90_limit,
     )
 
 

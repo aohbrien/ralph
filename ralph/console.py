@@ -352,6 +352,28 @@ def _format_tokens(tokens: int) -> str:
     return str(tokens)
 
 
+def _format_cost(cost_usd: float) -> str:
+    """
+    Format cost in USD for display.
+
+    Args:
+        cost_usd: Cost in USD
+
+    Returns:
+        Formatted cost string (e.g., "$1.23", "$0.05", "<$0.01")
+    """
+    if cost_usd < 0.01:
+        if cost_usd > 0:
+            return "<$0.01"
+        return "$0.00"
+    elif cost_usd >= 100:
+        return f"${cost_usd:.0f}"
+    elif cost_usd >= 10:
+        return f"${cost_usd:.1f}"
+    else:
+        return f"${cost_usd:.2f}"
+
+
 def _format_time_remaining(window_end: datetime, now: datetime | None = None) -> str:
     """
     Format the time remaining until window resets.
@@ -450,6 +472,8 @@ def print_usage_display(
     weekly_limit: int,
     opus_tokens: int,
     sonnet_tokens: int,
+    show_costs: bool = True,
+    p90_limit: int | None = None,
 ) -> None:
     """
     Print the complete usage display with progress bars and breakdown.
@@ -462,15 +486,19 @@ def print_usage_display(
         weekly_limit: Token limit for weekly window
         opus_tokens: Total tokens from Opus models
         sonnet_tokens: Total tokens from Sonnet models
+        show_costs: Whether to display cost information
+        p90_limit: P90-calculated limit (optional, for display)
     """
     console.print()
 
     # Header with plan info
-    console.print(Panel(
+    header_content = (
         f"[bold]Claude Code Usage[/bold]\n"
-        f"Plan: [cyan]{plan.value.upper()}[/cyan]",
-        style="blue",
-    ))
+        f"Plan: [cyan]{plan.value.upper()}[/cyan]"
+    )
+    if p90_limit is not None:
+        header_content += f"\nP90 Limit: [green]{_format_tokens(p90_limit)}[/green] tokens"
+    console.print(Panel(header_content, style="blue"))
 
     # Calculate percentages
     five_hour_pct = (five_hour_usage.total_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
@@ -539,6 +567,30 @@ def print_usage_display(
 
     console.print()
     console.print(table)
+
+    # Cost breakdown if enabled
+    if show_costs:
+        five_hour_cost = five_hour_usage.cost_usd
+        weekly_cost = weekly_usage.cost_usd
+
+        console.print()
+        cost_table = Table(
+            title="Cost Breakdown",
+            show_header=True,
+            header_style="bold",
+        )
+        cost_table.add_column("Window", style="cyan", width=15)
+        cost_table.add_column("Cost (USD)", justify="right", width=12)
+
+        cost_table.add_row(
+            "5-Hour",
+            _format_cost(five_hour_cost),
+        )
+        cost_table.add_row(
+            "Weekly",
+            _format_cost(weekly_cost),
+        )
+        console.print(cost_table)
 
     # Additional stats
     console.print()
@@ -710,6 +762,7 @@ def print_iteration_usage(
     percentage: float,
     tokens_used: int,
     tokens_limit: int,
+    cost_usd: float | None = None,
 ) -> None:
     """
     Print a brief usage summary after each iteration.
@@ -718,20 +771,25 @@ def print_iteration_usage(
         percentage: Current usage percentage
         tokens_used: Tokens used in the window
         tokens_limit: Token limit for the window
+        cost_usd: Optional cost for the current window
     """
     color = _get_usage_color(percentage)
     remaining = max(0, tokens_limit - tokens_used)
-    console.print(
+    usage_str = (
         f"[dim]Usage:[/dim] [{color}]{percentage:.1f}%[/{color}] "
         f"({_format_tokens(tokens_used)} / {_format_tokens(tokens_limit)}, "
         f"[cyan]{_format_tokens(remaining)}[/cyan] remaining)"
     )
+    if cost_usd is not None:
+        usage_str += f" | Cost: [green]{_format_cost(cost_usd)}[/green]"
+    console.print(usage_str)
 
 
 def print_usage_history(
     windows: list["UsageAggregate"],
     five_hour_limit: int,
     days: int,
+    show_costs: bool = True,
 ) -> None:
     """
     Print historical usage data as a table with 5-hour windows.
@@ -740,6 +798,7 @@ def print_usage_history(
         windows: List of UsageAggregate objects for each 5-hour window
         five_hour_limit: Token limit for 5-hour window (used for highlighting)
         days: Number of days of history being displayed
+        show_costs: Whether to show cost column
     """
     console.print()
     console.print(Panel(
@@ -766,6 +825,8 @@ def print_usage_history(
     table.add_column("Tokens", justify="right", width=12)
     table.add_column("Messages", justify="right", width=10)
     table.add_column("% of Limit", justify="right", width=10)
+    if show_costs:
+        table.add_column("Cost", justify="right", width=10)
     table.add_column("Status", justify="center", width=10)
 
     for window in windows:
@@ -797,20 +858,33 @@ def print_usage_history(
         tokens_display = f"[{color}]{tokens_str}[/{color}]"
         pct_display = f"[{color}]{percentage:.1f}%[/{color}]"
 
-        table.add_row(
-            start_str,
-            end_str,
-            tokens_display,
-            str(window.message_count),
-            pct_display,
-            status,
-        )
+        if show_costs:
+            cost_display = _format_cost(window.cost_usd)
+            table.add_row(
+                start_str,
+                end_str,
+                tokens_display,
+                str(window.message_count),
+                pct_display,
+                cost_display,
+                status,
+            )
+        else:
+            table.add_row(
+                start_str,
+                end_str,
+                tokens_display,
+                str(window.message_count),
+                pct_display,
+                status,
+            )
 
     console.print(table)
 
     # Summary stats
     total_tokens = sum(w.total_tokens for w in windows)
     total_messages = sum(w.message_count for w in windows)
+    total_cost = sum(w.cost_usd for w in windows)
     exceeded_count = sum(1 for w in windows if w.total_tokens >= five_hour_limit)
     high_count = sum(1 for w in windows if threshold <= w.total_tokens < five_hour_limit)
 
@@ -818,5 +892,7 @@ def print_usage_history(
     console.print(f"[bold]Summary:[/bold]")
     console.print(f"  Total tokens: {_format_tokens(total_tokens)}")
     console.print(f"  Total messages: {total_messages}")
+    if show_costs:
+        console.print(f"  Total cost: [green]{_format_cost(total_cost)}[/green]")
     console.print(f"  Windows with high usage (>80%): [yellow]{high_count}[/yellow]")
     console.print(f"  Windows that exceeded limit: [red]{exceeded_count}[/red]")
