@@ -260,7 +260,38 @@ def run_tool(
         ProcessResult with output and completion status
     """
     prompt_text = prompt_path.read_text()
+    return run_tool_with_prompt(
+        tool=tool,
+        prompt=prompt_text,
+        on_output=on_output,
+        cwd=cwd,
+        managed_process=managed_process,
+        timeout=timeout,
+    )
 
+
+def run_tool_with_prompt(
+    tool: Tool,
+    prompt: str,
+    on_output: Callable[[str], None] | None = None,
+    cwd: Path | None = None,
+    managed_process: ManagedProcess | None = None,
+    timeout: float | None = None,
+) -> ProcessResult:
+    """
+    Run an AI tool with a prompt string.
+
+    Args:
+        tool: Which AI tool to use (claude or amp)
+        prompt: The prompt text to send to the tool
+        on_output: Callback for streaming output
+        cwd: Working directory
+        managed_process: Optional ManagedProcess for external termination control
+        timeout: Optional timeout in seconds (None = no timeout)
+
+    Returns:
+        ProcessResult with output and completion status
+    """
     if tool == Tool.CLAUDE:
         base_cmd = "claude --dangerously-skip-permissions --print"
     else:  # Tool.AMP
@@ -273,7 +304,7 @@ def run_tool(
 
     return stream_process(
         cmd=["bash", "-c", bash_cmd],
-        input_text=prompt_text,
+        input_text=prompt,
         on_output=on_output,
         cwd=cwd,
         managed_process=managed_process,

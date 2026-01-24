@@ -17,16 +17,23 @@ from ralph.console import (
     print_info,
     print_interrupt,
     print_iteration_header,
+    print_iteration_usage,
     print_max_iterations_reached,
+    print_pacing_adjustment,
     print_prd_status,
     print_resume_info,
+    print_retry,
+    print_retry_exhausted,
     print_task_list,
     print_timeout,
+    print_usage_critical,
+    print_usage_warning,
     print_warning,
 )
 from ralph.conversation import ConversationWatcher
-from ralph.prd import PRD
-from ralph.process import ManagedProcess, ProcessResult, Tool, run_tool
+from ralph.prd import PRD, UserStory
+from ralph.process import ManagedProcess, ProcessResult, Tool, run_tool_with_prompt
+from ralph.session import SessionManager, get_budget_for_session, update_heartbeat
 from ralph.state import RunState, clear_state, load_state, save_state
 from ralph.tasks import get_all_tasks_for_project, ClaudeTask
 
@@ -34,6 +41,16 @@ from ralph.tasks import get_all_tasks_for_project, ClaudeTask
 DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_ITERATION_DELAY = 2.0  # seconds
 DEFAULT_TIMEOUT = 30 * 60  # 30 minutes in seconds
+DEFAULT_MAX_RETRIES = 2  # per-iteration retry attempts
+RETRY_BACKOFF_BASE = 5.0  # seconds for first retry (5s, 15s, 45s with multiplier 3)
+
+# Adaptive pacing thresholds and multipliers
+DEFAULT_PACING_THRESHOLD_1 = 70.0  # 70% usage - 2x delay
+DEFAULT_PACING_THRESHOLD_2 = 80.0  # 80% usage - 4x delay
+DEFAULT_PACING_THRESHOLD_3 = 90.0  # 90% usage - 8x delay
+DEFAULT_PACING_MULTIPLIER_1 = 2.0
+DEFAULT_PACING_MULTIPLIER_2 = 4.0
+DEFAULT_PACING_MULTIPLIER_3 = 8.0
 
 
 class Runner:
@@ -50,6 +67,12 @@ class Runner:
         timeout: float | None = DEFAULT_TIMEOUT,
         log_dir: Path | None = None,
         resume: bool = False,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        adaptive_pacing: bool = True,
+        pacing_threshold_1: float = DEFAULT_PACING_THRESHOLD_1,
+        pacing_threshold_2: float = DEFAULT_PACING_THRESHOLD_2,
+        pacing_threshold_3: float = DEFAULT_PACING_THRESHOLD_3,
+        five_hour_limit: int | None = None,
     ):
         self.prd_path = prd_path
         self.tool = tool
@@ -60,6 +83,17 @@ class Runner:
         self.timeout = timeout
         self.log_dir = log_dir
         self.resume = resume
+        self.max_retries = max_retries
+
+        # Adaptive pacing configuration
+        self.adaptive_pacing = adaptive_pacing
+        self.pacing_threshold_1 = pacing_threshold_1
+        self.pacing_threshold_2 = pacing_threshold_2
+        self.pacing_threshold_3 = pacing_threshold_3
+        self.five_hour_limit = five_hour_limit
+
+        # Track last pacing multiplier to only log changes
+        self._last_pacing_multiplier: float = 1.0
 
         # Derive paths
         self.base_dir = prd_path.parent
@@ -82,6 +116,61 @@ class Runner:
             return self.base_dir / "CLAUDE.md"
         else:
             return self.base_dir / "prompt.md"
+
+    def _generate_prompt(self, story: UserStory, prd: PRD) -> str:
+        """Generate a dynamic prompt for the current iteration."""
+        # Read the base prompt file (CLAUDE.md or prompt.md) for project context
+        base_context = ""
+        if self.prompt_path.exists():
+            base_context = self.prompt_path.read_text()
+
+        # Format acceptance criteria as a checklist
+        criteria_list = "\n".join(f"- [ ] {c}" for c in story.acceptance_criteria)
+
+        prompt = f"""# Task: Implement User Story {story.id}
+
+## Project Context
+{base_context}
+
+---
+
+## Your Assignment
+
+You are working on the **{prd.project}** project. Your task is to implement the following user story:
+
+### {story.id}: {story.title}
+
+**Description:** {story.description}
+
+**Acceptance Criteria:**
+{criteria_list}
+
+{f"**Notes:** {story.notes}" if story.notes else ""}
+
+## Instructions
+
+1. **Analyze** the codebase to understand the current implementation
+2. **Implement** the changes needed to satisfy ALL acceptance criteria
+3. **Test** your changes to ensure they work correctly
+4. **Update** the prd.json file to set `"passes": true` for story {story.id} once all criteria are met
+5. **Update** progress.txt with a summary of what you did
+
+## Important
+
+- Focus ONLY on this story - do not implement other stories
+- Make sure ALL acceptance criteria are satisfied before marking complete
+- Run `mypy ralph` to ensure type checking passes if the criteria mention it
+- Run `pytest` if tests are part of the acceptance criteria
+
+## Completion Signal
+
+When you have successfully implemented this story AND updated prd.json to mark it as passing, output:
+
+<promise>COMPLETE</promise>
+
+This signals to Ralph that the story is done and it should move to the next iteration.
+"""
+        return prompt
 
     def _get_progress_path(self) -> Path:
         """Get the progress file path."""
@@ -159,7 +248,34 @@ class Runner:
         """Load the PRD from file."""
         return PRD.from_file(self.prd_path)
 
-    def _save_run_state(self, iteration: int, story_id: str | None) -> None:
+    def _validate_prd_for_resume(self, state: RunState, prd: PRD) -> None:
+        """Validate that PRD hasn't changed significantly since the saved state."""
+        # Load the original story count from the state if available
+        # For now, we'll compare based on the path match and warn if story count seems off
+        state_prd_path = Path(state.prd_path).resolve()
+        current_prd_path = self.prd_path.resolve()
+
+        if state_prd_path != current_prd_path:
+            print_warning(
+                f"PRD path differs from saved state.\n"
+                f"  State: {state_prd_path}\n"
+                f"  Current: {current_prd_path}"
+            )
+
+        # Store story count in state for future validation
+        if hasattr(state, "story_count") and state.story_count is not None:
+            current_count = len(prd.user_stories)
+            if current_count != state.story_count:
+                print_warning(
+                    f"PRD story count changed since last run.\n"
+                    f"  Previous: {state.story_count} stories\n"
+                    f"  Current: {current_count} stories\n"
+                    f"  Resume may skip or repeat work."
+                )
+
+    def _save_run_state(
+        self, iteration: int, story_id: str | None, story_count: int | None = None
+    ) -> None:
         """Save run state for resume functionality."""
         if self._run_state is None:
             self._run_state = RunState.create(
@@ -167,6 +283,7 @@ class Runner:
                 tool=self.tool.value,
                 iteration=iteration,
                 story_id=story_id,
+                story_count=story_count,
             )
         else:
             self._run_state.update(iteration, story_id)
@@ -191,6 +308,165 @@ class Runner:
         if tasks:
             print_task_list(tasks, "Current Claude Tasks")
 
+    def _calculate_backoff(self, attempt: int) -> float:
+        """Calculate exponential backoff delay for retry attempt.
+
+        Uses formula: base * (3 ^ (attempt - 1))
+        This gives: 5s, 15s, 45s for attempts 1, 2, 3
+        """
+        return float(RETRY_BACKOFF_BASE * (3 ** (attempt - 1)))
+
+    def _get_usage_percentage(self) -> float | None:
+        """
+        Get the current 5-hour window usage percentage.
+
+        When cross-session coordination is enabled, this calculates the
+        percentage based on this session's share of the remaining budget.
+
+        Returns:
+            Usage percentage (0-100), or None if usage tracking is unavailable.
+        """
+        try:
+            from ralph.config import get_plan, get_plan_limits
+            from ralph.usage import get_5hour_window_usage
+
+            # Get the limit to use
+            if self.five_hour_limit is not None:
+                limit = self.five_hour_limit
+            else:
+                current_plan = get_plan()
+                limits = get_plan_limits(current_plan)
+                limit = limits["5hour_tokens"]
+
+            if limit <= 0:
+                return None
+
+            usage = get_5hour_window_usage()
+            total_used = usage.total_tokens
+
+            # Calculate remaining budget and divide across active sessions
+            remaining = max(0, limit - total_used)
+            session_budget, num_sessions = get_budget_for_session(remaining)
+
+            # Calculate this session's effective limit (used + session share of remaining)
+            # This ensures each session sees their fair share of the remaining budget
+            effective_limit = total_used + session_budget
+
+            if effective_limit <= 0:
+                return 100.0  # Fully used
+
+            # Calculate percentage based on effective limit
+            percentage = (total_used / effective_limit) * 100
+            return min(percentage, 100.0)
+        except Exception:
+            # If usage tracking fails, don't block the run
+            return None
+
+    def _calculate_adaptive_delay(self, usage_percentage: float | None) -> tuple[float, float]:
+        """
+        Calculate the adaptive iteration delay based on usage percentage.
+
+        Args:
+            usage_percentage: Current usage percentage (0-100), or None
+
+        Returns:
+            Tuple of (adjusted delay in seconds, multiplier applied)
+        """
+        if usage_percentage is None or not self.adaptive_pacing:
+            return self.iteration_delay, 1.0
+
+        # Determine multiplier based on thresholds
+        if usage_percentage >= self.pacing_threshold_3:
+            multiplier = DEFAULT_PACING_MULTIPLIER_3
+        elif usage_percentage >= self.pacing_threshold_2:
+            multiplier = DEFAULT_PACING_MULTIPLIER_2
+        elif usage_percentage >= self.pacing_threshold_1:
+            multiplier = DEFAULT_PACING_MULTIPLIER_1
+        else:
+            multiplier = 1.0
+
+        adjusted_delay = self.iteration_delay * multiplier
+        return adjusted_delay, multiplier
+
+    def _apply_adaptive_pacing(self) -> float:
+        """
+        Check usage and apply adaptive pacing if needed.
+
+        Returns:
+            The delay to use (either base delay or adjusted delay).
+        """
+        usage_percentage = self._get_usage_percentage()
+        adjusted_delay, multiplier = self._calculate_adaptive_delay(usage_percentage)
+
+        # Only log when multiplier changes (to avoid spamming logs)
+        if multiplier != self._last_pacing_multiplier and multiplier > 1.0:
+            if usage_percentage is not None:
+                print_pacing_adjustment(
+                    usage_percentage=usage_percentage,
+                    base_delay=self.iteration_delay,
+                    adjusted_delay=adjusted_delay,
+                    multiplier=multiplier,
+                )
+            self._last_pacing_multiplier = multiplier
+        elif multiplier < self._last_pacing_multiplier:
+            # Usage has decreased, reset tracking
+            if self.verbose and usage_percentage is not None:
+                print_info(f"Usage at {usage_percentage:.1f}%, returning to normal pacing")
+            self._last_pacing_multiplier = multiplier
+
+        return adjusted_delay
+
+    def _display_iteration_usage(self) -> None:
+        """
+        Display current usage after each iteration and show warnings if thresholds exceeded.
+
+        Shows:
+        - Brief usage summary after every iteration
+        - Warning banner at 70% usage
+        - Critical warning banner at 90% usage
+        - Time until window resets in warnings
+        """
+        try:
+            from datetime import timedelta
+
+            from ralph.config import get_plan, get_plan_limits
+            from ralph.console import _format_time_remaining
+            from ralph.usage import get_5hour_window_usage
+
+            # Get the limit to use
+            if self.five_hour_limit is not None:
+                limit = self.five_hour_limit
+            else:
+                current_plan = get_plan()
+                limits = get_plan_limits(current_plan)
+                limit = limits["5hour_tokens"]
+
+            if limit <= 0:
+                return
+
+            usage = get_5hour_window_usage()
+            total_used = usage.total_tokens
+            percentage = (total_used / limit * 100) if limit > 0 else 0
+
+            # Always display brief usage summary after each iteration
+            print_iteration_usage(percentage, total_used, limit)
+
+            # Calculate time until window resets (for rolling windows, oldest data ages out)
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc)
+            time_until_reset = _format_time_remaining(now + timedelta(hours=5), now)
+
+            # Show warning banners based on thresholds
+            if percentage >= 90:
+                print_usage_critical(percentage, total_used, limit, time_until_reset)
+            elif percentage >= 70:
+                print_usage_warning(percentage, total_used, limit, time_until_reset)
+
+        except Exception:
+            # If usage tracking fails, don't block the run
+            pass
+
     def run_iteration(self, iteration: int) -> tuple[ProcessResult, str | None]:
         """
         Run a single iteration.
@@ -209,25 +485,28 @@ class Runner:
         # Display current tasks if enabled
         self._display_tasks()
 
-        # Check if prompt file exists
-        if not self.prompt_path.exists():
-            print_error(f"Prompt file not found: {self.prompt_path}")
-            return ProcessResult(output="", return_code=1, completed=False), story_id
+        # Check if there's a story to work on
+        if next_story is None:
+            print_info("No incomplete stories found - all done!")
+            return ProcessResult(output="", return_code=0, completed=True), None
+
+        # Generate the dynamic prompt for this story
+        prompt = self._generate_prompt(next_story, prd)
 
         if self.verbose:
-            print_info(f"Running {self.tool.value} with prompt: {self.prompt_path}")
+            print_info(f"Running {self.tool.value} for story: {next_story.id}")
 
         # Start conversation watcher for real-time log display
         watcher = ConversationWatcher(self.base_dir)
         watcher.start()
 
-        # Run the tool
+        # Run the tool with the generated prompt
         self._managed_process.reset()
         output_handler = self._create_output_handler()
         try:
-            result = run_tool(
+            result = run_tool_with_prompt(
                 tool=self.tool,
-                prompt_path=self.prompt_path,
+                prompt=prompt,
                 on_output=output_handler,
                 cwd=self.base_dir,
                 managed_process=self._managed_process,
@@ -245,6 +524,61 @@ class Runner:
 
         return result, story_id
 
+    def _run_iteration_with_retry(
+        self, iteration: int
+    ) -> tuple[ProcessResult, str | None]:
+        """
+        Run a single iteration with retry logic for transient failures.
+
+        Retries on non-zero exit code from Claude, but NOT on timeout.
+        Uses exponential backoff between retries (5s, 15s, 45s).
+
+        Returns:
+            Tuple of (ProcessResult from tool execution, story ID or None)
+        """
+        result, story_id = self.run_iteration(iteration)
+
+        # Don't retry on success, timeout, interrupt, or completion
+        if (
+            result.return_code == 0
+            or result.timed_out
+            or result.interrupted
+            or result.completed
+        ):
+            return result, story_id
+
+        # Retry logic for non-zero exit codes
+        for attempt in range(1, self.max_retries + 1):
+            # Check for interrupt before retrying
+            if self._interrupted:
+                return result, story_id
+
+            backoff = self._calculate_backoff(attempt)
+            print_retry(iteration, attempt, self.max_retries, result.return_code, backoff)
+
+            # Wait with backoff
+            time.sleep(backoff)
+
+            # Check for interrupt after waiting
+            if self._interrupted:
+                return result, story_id
+
+            # Retry the iteration
+            result, story_id = self.run_iteration(iteration)
+
+            # If this attempt succeeded or hit a terminal condition, return
+            if (
+                result.return_code == 0
+                or result.timed_out
+                or result.interrupted
+                or result.completed
+            ):
+                return result, story_id
+
+        # All retries exhausted, log and continue to next iteration
+        print_retry_exhausted(iteration, self.max_retries, result.return_code)
+        return result, story_id
+
     def run(self) -> bool | int:
         """
         Run the main loop.
@@ -259,7 +593,12 @@ class Runner:
         self._install_signal_handlers()
 
         try:
-            return self._run_loop()
+            # Use SessionManager for cross-session coordination
+            # This registers our session and automatically cleans up on exit
+            with SessionManager(prd_path=self.prd_path) as session:
+                if self.verbose:
+                    print_info(f"Registered session (PID={session.pid})")
+                return self._run_loop()
         finally:
             self._restore_signal_handlers()
 
@@ -272,6 +611,9 @@ class Runner:
         if self.resume:
             existing_state = load_state(self.base_dir)
             if existing_state:
+                # Validate PRD hasn't changed significantly
+                self._validate_prd_for_resume(existing_state, prd)
+
                 # Resume from last completed iteration
                 self._start_iteration = existing_state.last_iteration + 1
                 self._run_state = existing_state
@@ -319,13 +661,18 @@ class Runner:
                 print_interrupt(iteration, completed, total)
                 return 130  # Standard exit code for SIGINT
 
-            result, story_id = self.run_iteration(iteration)
+            # Run iteration with retry logic
+            result, story_id = self._run_iteration_with_retry(iteration)
 
             # Save iteration log
             self._save_iteration_log(iteration, story_id, result.output)
 
             # Save run state for resume functionality
-            self._save_run_state(iteration, story_id)
+            prd = self._load_prd()
+            self._save_run_state(iteration, story_id, len(prd.user_stories))
+
+            # Display current usage after each iteration (with warnings if thresholds exceeded)
+            self._display_iteration_usage()
 
             # Check for interrupt after iteration
             if self._interrupted or result.interrupted:
@@ -334,21 +681,21 @@ class Runner:
                 print_interrupt(iteration, completed, total)
                 return 130  # Standard exit code for SIGINT
 
-            # Check for timeout - log and continue to next iteration
+            # Check for timeout - log and continue to next iteration (no retry on timeout)
             if result.timed_out:
                 print_timeout(iteration)
                 # Continue to next iteration rather than stopping
                 if iteration < self.max_iterations:
+                    delay = self._apply_adaptive_pacing()
                     if self.verbose:
-                        print_info(f"Waiting {self.iteration_delay}s before next iteration...")
-                    time.sleep(self.iteration_delay)
+                        print_info(f"Waiting {delay:.1f}s before next iteration...")
+                    time.sleep(delay)
+                    # Update session heartbeat during delay
+                    update_heartbeat()
                 continue
 
-            # Check for completion
-            if result.completed:
-                print_completion()
-                clear_state(self.base_dir)
-                return True
+            # Note: result.completed means the story signaled completion with <promise>COMPLETE</promise>
+            # This just means this story is done - we still need to check if ALL stories are done
 
             # Reload PRD to check if all stories are done
             prd = self._load_prd()
@@ -359,9 +706,12 @@ class Runner:
 
             # Wait before next iteration (unless this was the last one)
             if iteration < self.max_iterations:
+                delay = self._apply_adaptive_pacing()
                 if self.verbose:
-                    print_info(f"Waiting {self.iteration_delay}s before next iteration...")
-                time.sleep(self.iteration_delay)
+                    print_info(f"Waiting {delay:.1f}s before next iteration...")
+                time.sleep(delay)
+                # Update session heartbeat during delay
+                update_heartbeat()
 
         # Max iterations reached without completion
         print_max_iterations_reached(self.max_iterations)
@@ -377,6 +727,12 @@ def run_ralph(
     timeout: float | None = DEFAULT_TIMEOUT,
     log_dir: Path | None = None,
     resume: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    adaptive_pacing: bool = True,
+    pacing_threshold_1: float = DEFAULT_PACING_THRESHOLD_1,
+    pacing_threshold_2: float = DEFAULT_PACING_THRESHOLD_2,
+    pacing_threshold_3: float = DEFAULT_PACING_THRESHOLD_3,
+    five_hour_limit: int | None = None,
 ) -> bool | int:
     """
     Convenience function to run Ralph.
@@ -390,6 +746,12 @@ def run_ralph(
         timeout: Per-iteration timeout in seconds (None = no timeout)
         log_dir: Directory to save iteration logs (None = no logging)
         resume: Resume from previous run state
+        max_retries: Per-iteration retry attempts for transient failures
+        adaptive_pacing: Enable adaptive pacing based on usage
+        pacing_threshold_1: Usage % for 2x delay (default: 70)
+        pacing_threshold_2: Usage % for 4x delay (default: 80)
+        pacing_threshold_3: Usage % for 8x delay (default: 90)
+        five_hour_limit: Override 5-hour token limit (None = use plan limit)
 
     Returns:
         True if all stories were completed
@@ -406,5 +768,11 @@ def run_ralph(
         timeout=timeout,
         log_dir=log_dir,
         resume=resume,
+        max_retries=max_retries,
+        adaptive_pacing=adaptive_pacing,
+        pacing_threshold_1=pacing_threshold_1,
+        pacing_threshold_2=pacing_threshold_2,
+        pacing_threshold_3=pacing_threshold_3,
+        five_hour_limit=five_hour_limit,
     )
     return runner.run()
