@@ -99,7 +99,7 @@ class Config:
     """User configuration for Ralph."""
 
     plan: Plan = DEFAULT_PLAN
-    limit_mode: LimitMode = LimitMode.PLAN
+    limit_mode: LimitMode = LimitMode.P90
     enable_cost_tracking: bool = True
     p90_lookback_days: int = 14
 
@@ -130,12 +130,12 @@ class Config:
             except (ValueError, AttributeError, TypeError) as e:
                 logger.warning(f"Invalid plan in config: {e}. Using default: {DEFAULT_PLAN.value}")
 
-        limit_mode = LimitMode.PLAN
+        limit_mode = LimitMode.P90
         if "limit_mode" in data:
             try:
                 limit_mode = LimitMode(data["limit_mode"])
             except (ValueError, AttributeError, TypeError) as e:
-                logger.warning(f"Invalid limit_mode in config: {e}. Using default: plan")
+                logger.warning(f"Invalid limit_mode in config: {e}. Using default: p90")
 
         enable_cost_tracking = True
         if "enable_cost_tracking" in data:

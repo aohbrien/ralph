@@ -39,8 +39,21 @@ class UsageRecord:
 
     @property
     def total_tokens(self) -> int:
-        """Total tokens (input + output)."""
+        """Total tokens (input + output + all cache)."""
         return self.total_input_tokens + self.output_tokens
+
+    @property
+    def rate_limited_tokens(self) -> int:
+        """Tokens that count toward rate limits.
+
+        Cache reads are excluded as they represent reused context
+        and don't count toward Anthropic's rate limits.
+        """
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+        )
 
     @property
     def is_opus(self) -> bool:
@@ -268,8 +281,21 @@ class UsageAggregate:
 
     @property
     def total_tokens(self) -> int:
-        """Total tokens (input + output)."""
+        """Total tokens (input + output + all cache)."""
         return self.total_input_tokens + self.output_tokens
+
+    @property
+    def rate_limited_tokens(self) -> int:
+        """Tokens that count toward rate limits.
+
+        Cache reads are excluded as they represent reused context
+        and don't count toward Anthropic's rate limits.
+        """
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+        )
 
 
 def _aggregate_records(
@@ -457,7 +483,7 @@ class PreflightCheck:
     @property
     def tokens_remaining(self) -> int:
         """Tokens remaining in the 5-hour window."""
-        return max(0, self.limit - self.current_usage.total_tokens)
+        return max(0, self.limit - self.current_usage.rate_limited_tokens)
 
 
 # Estimated tokens per Ralph iteration
@@ -491,11 +517,11 @@ def check_usage_before_run(
     if five_hour_limit is None:
         five_hour_limit = 300_000  # Pro tier default
 
-    # Calculate percentage used
-    percentage = (usage.total_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
+    # Calculate percentage used (using rate_limited_tokens, not total_tokens)
+    percentage = (usage.rate_limited_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
 
     # Calculate estimated iterations remaining
-    tokens_remaining = max(0, five_hour_limit - usage.total_tokens)
+    tokens_remaining = max(0, five_hour_limit - usage.rate_limited_tokens)
     estimated_iterations = int(tokens_remaining / ESTIMATED_TOKENS_PER_ITERATION)
 
     # Determine warning and blocking thresholds

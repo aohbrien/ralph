@@ -83,6 +83,14 @@ def _is_complete_window(window: "UsageAggregate") -> bool:
     return duration >= timedelta(hours=4, minutes=54)
 
 
+def _get_window_tokens(window: "UsageAggregate") -> int:
+    """Get the token count for rate limiting purposes.
+
+    Uses rate_limited_tokens which excludes cache reads.
+    """
+    return window.rate_limited_tokens
+
+
 def _calculate_p90_from_windows(
     windows: list["UsageAggregate"],
     config: P90Config,
@@ -99,20 +107,21 @@ def _calculate_p90_from_windows(
     """
     # Extract token counts from windows that "hit" a limit
     # Only consider complete windows (not the current/active one)
+    # Use rate_limited_tokens (excludes cache reads)
     hit_windows = [
-        w.total_tokens
+        _get_window_tokens(w)
         for w in windows
         if _is_complete_window(w)
-        and w.total_tokens > 0
-        and _did_hit_limit(w.total_tokens, config.common_limits, config.limit_threshold)
+        and _get_window_tokens(w) > 0
+        and _did_hit_limit(_get_window_tokens(w), config.common_limits, config.limit_threshold)
     ]
 
     # If no limit-hitting windows, fall back to all complete windows
     if not hit_windows:
         hit_windows = [
-            w.total_tokens
+            _get_window_tokens(w)
             for w in windows
-            if _is_complete_window(w) and w.total_tokens > 0
+            if _is_complete_window(w) and _get_window_tokens(w) > 0
         ]
 
     # If still no data, return default

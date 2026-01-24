@@ -121,7 +121,7 @@ class TestConfigDataclass:
         result = config.to_dict()
 
         assert result["plan"] == "max5x"
-        assert result["limit_mode"] == "plan"
+        assert result["limit_mode"] == "p90"
         assert result["enable_cost_tracking"] is True
         assert result["p90_lookback_days"] == 14
 
@@ -203,7 +203,7 @@ class TestSaveConfig:
                 data = json.load(f)
 
             assert data["plan"] == "max5x"
-            assert data["limit_mode"] == "plan"
+            assert data["limit_mode"] == "p90"
             assert data["enable_cost_tracking"] is True
             assert data["p90_lookback_days"] == 14
 
@@ -765,7 +765,7 @@ class TestLimitModeConfig:
     def test_config_default_limit_mode(self):
         """Test that Config has correct default limit mode."""
         config = Config()
-        assert config.limit_mode == LimitMode.PLAN
+        assert config.limit_mode == LimitMode.P90
 
     def test_config_from_dict_limit_mode(self):
         """Test creating Config with limit_mode from dictionary."""
@@ -777,7 +777,7 @@ class TestLimitModeConfig:
         """Test that invalid limit_mode uses default."""
         data = {"plan": "pro", "limit_mode": "invalid"}
         config = Config.from_dict(data)
-        assert config.limit_mode == LimitMode.PLAN
+        assert config.limit_mode == LimitMode.P90
 
     def test_config_round_trip_limit_mode(self):
         """Test that limit_mode survives round-trip."""

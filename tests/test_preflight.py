@@ -1099,8 +1099,8 @@ class TestPreflightEdgeCases:
             assert result.should_warn is False
             assert result.should_block is False
 
-    def test_cache_tokens_included_in_calculation(self):
-        """Test that cache tokens are included in usage calculation."""
+    def test_cache_tokens_in_calculation(self):
+        """Test that cache creation is included but cache reads excluded from rate limiting."""
         with create_temp_fixture_directory() as fixture:
             now = datetime(2025, 1, 20, 15, 0, 0, tzinfo=timezone.utc)
 
@@ -1123,10 +1123,17 @@ class TestPreflightEdgeCases:
                 now=now,
             )
 
-            # Total per record: 5000 + 5000 + 2500 + 2500 = 15000
-            # 10 records = 150000 tokens
+            # total_tokens includes all: 5000 + 5000 + 2500 + 2500 = 15000 per record
+            # 10 records = 150000 total tokens (for cost calculation)
             assert result.current_usage.total_tokens == 150000
-            assert result.percentage == 50.0
+
+            # rate_limited_tokens excludes cache reads: 5000 + 5000 + 2500 = 12500 per record
+            # 10 records = 125000 rate-limited tokens
+            assert result.current_usage.rate_limited_tokens == 125000
+
+            # Percentage is based on rate_limited_tokens
+            # 125000 / 300000 = 41.67%
+            assert abs(result.percentage - 41.67) < 0.1
 
     def test_uses_plan_limit_correctly(self):
         """Test that different plan limits affect thresholds correctly."""

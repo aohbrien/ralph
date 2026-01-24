@@ -342,7 +342,7 @@ This signals to Ralph that the story is done and it should move to the next iter
                 return None
 
             usage = get_5hour_window_usage()
-            total_used = usage.total_tokens
+            total_used = usage.rate_limited_tokens  # Excludes cache reads
 
             # Calculate remaining budget and divide across active sessions
             remaining = max(0, limit - total_used)
@@ -449,7 +449,7 @@ This signals to Ralph that the story is done and it should move to the next iter
                 return
 
             usage = get_5hour_window_usage()
-            total_used = usage.total_tokens
+            total_used = usage.rate_limited_tokens  # Excludes cache reads
             percentage = (total_used / limit * 100) if limit > 0 else 0
 
             # Get cost for display if enabled

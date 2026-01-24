@@ -158,7 +158,7 @@ def run(
         help="Usage %% threshold for 8x delay (default: 90)",
     ),
     limit_mode: str = typer.Option(
-        "plan",
+        "p90",
         "--limit-mode",
         help="Limit detection mode: plan, p90, or hybrid",
     ),
@@ -612,7 +612,7 @@ def resume(
         help="Usage %% threshold for 8x delay (default: 90)",
     ),
     limit_mode: str = typer.Option(
-        "plan",
+        "p90",
         "--limit-mode",
         help="Limit detection mode: plan, p90, or hybrid",
     ),
@@ -734,17 +734,20 @@ def usage(
             print_error(str(e))
             raise typer.Exit(1)
 
-    # Get current plan and its limits
+    # Get current plan and effective limits (respects limit_mode config)
     current_plan = get_plan()
-    limits = get_plan_limits(current_plan)
+    limits = get_effective_limit(plan=current_plan)
 
-    # Get P90 limit if requested
+    # Get P90 limit for display if requested
     p90_limit = None
     if show_p90:
         from ralph.p90 import get_p90_limit
         p90_limit = get_p90_limit()
         if p90_limit is None:
             print_info("Insufficient data for P90 calculation")
+        else:
+            # Update limits to show P90 in the display
+            limits = {"5hour_tokens": p90_limit, "weekly_tokens": p90_limit * 5}
 
     # Handle --history option
     if history is not None:

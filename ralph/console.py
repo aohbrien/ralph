@@ -500,31 +500,31 @@ def print_usage_display(
         header_content += f"\nP90 Limit: [green]{_format_tokens(p90_limit)}[/green] tokens"
     console.print(Panel(header_content, style="blue"))
 
-    # Calculate percentages
-    five_hour_pct = (five_hour_usage.total_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
-    weekly_pct = (weekly_usage.total_tokens / weekly_limit * 100) if weekly_limit > 0 else 0
+    # Calculate percentages using rate_limited_tokens (excludes cache reads)
+    five_hour_pct = (five_hour_usage.rate_limited_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
+    weekly_pct = (weekly_usage.rate_limited_tokens / weekly_limit * 100) if weekly_limit > 0 else 0
 
     # Time remaining calculations
     now = datetime.now(timezone.utc)
     five_hour_time_remaining = _format_time_remaining(now + timedelta(hours=5), now)
     weekly_time_remaining = _format_time_remaining(now + timedelta(days=7), now)
 
-    # 5-hour window progress bar
+    # 5-hour window progress bar (using rate_limited_tokens)
     five_hour_panel = _create_progress_bar(
         percentage=five_hour_pct,
         label="5-Hour Window",
-        used=five_hour_usage.total_tokens,
+        used=five_hour_usage.rate_limited_tokens,
         limit=five_hour_limit,
         window_name="Rolling 5-hour window",
         time_remaining=five_hour_time_remaining,
     )
     console.print(five_hour_panel)
 
-    # Weekly window progress bar
+    # Weekly window progress bar (using rate_limited_tokens)
     weekly_panel = _create_progress_bar(
         percentage=weekly_pct,
         label="Weekly Window",
-        used=weekly_usage.total_tokens,
+        used=weekly_usage.rate_limited_tokens,
         limit=weekly_limit,
         window_name="Rolling 7-day window",
         time_remaining=weekly_time_remaining,
@@ -834,20 +834,23 @@ def print_usage_history(
         start_str = window.window_start.strftime("%Y-%m-%d %H:%M")
         end_str = window.window_end.strftime("%Y-%m-%d %H:%M")
 
+        # Use rate_limited_tokens (excludes cache reads)
+        window_tokens = window.rate_limited_tokens
+
         # Calculate percentage of limit
-        percentage = (window.total_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
+        percentage = (window_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
 
         # Format tokens
-        tokens_str = _format_tokens(window.total_tokens)
+        tokens_str = _format_tokens(window_tokens)
 
         # Determine color and status based on usage
-        if window.total_tokens >= five_hour_limit:
+        if window_tokens >= five_hour_limit:
             color = "red"
             status = "[red]EXCEEDED[/red]"
-        elif window.total_tokens >= threshold:
+        elif window_tokens >= threshold:
             color = "yellow"
             status = "[yellow]HIGH[/yellow]"
-        elif window.total_tokens > 0:
+        elif window_tokens > 0:
             color = "green"
             status = "[green]OK[/green]"
         else:
@@ -881,12 +884,12 @@ def print_usage_history(
 
     console.print(table)
 
-    # Summary stats
-    total_tokens = sum(w.total_tokens for w in windows)
+    # Summary stats (using rate_limited_tokens)
+    total_tokens = sum(w.rate_limited_tokens for w in windows)
     total_messages = sum(w.message_count for w in windows)
     total_cost = sum(w.cost_usd for w in windows)
-    exceeded_count = sum(1 for w in windows if w.total_tokens >= five_hour_limit)
-    high_count = sum(1 for w in windows if threshold <= w.total_tokens < five_hour_limit)
+    exceeded_count = sum(1 for w in windows if w.rate_limited_tokens >= five_hour_limit)
+    high_count = sum(1 for w in windows if threshold <= w.rate_limited_tokens < five_hour_limit)
 
     console.print()
     console.print(f"[bold]Summary:[/bold]")

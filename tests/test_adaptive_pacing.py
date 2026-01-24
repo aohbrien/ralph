@@ -1022,7 +1022,8 @@ class TestGetUsagePercentage:
 
             # Mock usage data
             mock_usage = MagicMock()
-            mock_usage.total_tokens = 50000  # 50% of custom limit
+            mock_usage.total_tokens = 50000
+            mock_usage.rate_limited_tokens = 50000  # 50% of custom limit (excludes cache reads)
 
             # Patch at the source module and session module
             with patch("ralph.usage.get_5hour_window_usage", return_value=mock_usage):

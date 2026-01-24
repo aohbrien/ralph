@@ -35,6 +35,7 @@ pip install -e .
 | `ralph resume` | Resume an interrupted run |
 | `ralph archive` | Archive current run state |
 | `ralph tasks` | Show Claude task list |
+| `ralph usage` | Show usage statistics and costs |
 
 ## PRD Format
 
@@ -73,6 +74,51 @@ Key options:
 - `--timeout` - Per-iteration timeout in minutes (default: 30)
 - `--verbose, -v` - Enable verbose output
 - `--dry-run` - Show plan without executing
+- `--limit-mode` - Limit detection: `plan`, `p90`, or `hybrid` (default: p90)
+- `--cost-tracking/--no-cost-tracking` - Enable/disable cost display (default: enabled)
+
+## Usage Tracking & Cost Management
+
+Ralph tracks Claude API usage and calculates costs based on model-specific pricing.
+
+### View Usage
+
+```bash
+ralph usage              # Show current usage with costs
+ralph usage --p90        # Show P90-calculated limit
+ralph usage --history 7  # Show 7 days of usage history
+ralph usage --no-costs   # Hide cost information
+```
+
+### Limit Detection Modes
+
+Ralph supports three modes for determining token limits:
+
+| Mode | Description |
+|------|-------------|
+| `p90` | Auto-detect limits from usage history (90th percentile) **(default)** |
+| `plan` | Use hardcoded limits based on your Claude plan |
+| `hybrid` | Use P90 if higher than plan limits, otherwise use plan |
+
+```bash
+ralph run --limit-mode p90      # Use auto-detected limits
+ralph run --limit-mode hybrid   # Use whichever is higher
+```
+
+### Set Your Plan
+
+```bash
+ralph usage --set-plan pro      # Set plan: free, pro, max5x, max20x
+```
+
+### Cost Tracking
+
+Costs are calculated using official Anthropic pricing for all Claude models including:
+- Claude Opus 4.5, Opus 4
+- Claude Sonnet 4, Sonnet 3.5
+- Claude Haiku 3.5, Haiku 3
+
+Costs are displayed after each iteration and in usage summaries.
 
 ## How It Works
 
