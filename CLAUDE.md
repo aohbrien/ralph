@@ -30,8 +30,11 @@ ralph resume --prd path/to/prd.json
 # Archive current run state
 ralph archive --prd path/to/prd.json
 
-# Run tests
+# Run tests (parallel, excludes slow tests by default)
 pytest
+
+# Run all tests including slow integration tests
+pytest -m ""
 
 # Type checking
 mypy ralph
