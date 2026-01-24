@@ -421,7 +421,7 @@ This signals to Ralph that the story is done and it should move to the next iter
         Display current usage after each iteration and show warnings if thresholds exceeded.
 
         Shows:
-        - Brief usage summary after every iteration
+        - Brief usage summary after every iteration (with cost if enabled)
         - Warning banner at 70% usage
         - Critical warning banner at 90% usage
         - Time until window resets in warnings
@@ -429,9 +429,13 @@ This signals to Ralph that the story is done and it should move to the next iter
         try:
             from datetime import timedelta
 
-            from ralph.config import get_plan, get_plan_limits
+            from ralph.config import get_plan, get_plan_limits, load_config
             from ralph.console import _format_time_remaining
             from ralph.usage import get_5hour_window_usage
+
+            # Get config to check if cost tracking is enabled
+            config = load_config()
+            show_cost = config.enable_cost_tracking
 
             # Get the limit to use
             if self.five_hour_limit is not None:
@@ -448,8 +452,11 @@ This signals to Ralph that the story is done and it should move to the next iter
             total_used = usage.total_tokens
             percentage = (total_used / limit * 100) if limit > 0 else 0
 
+            # Get cost for display if enabled
+            cost_usd = usage.cost_usd if show_cost else None
+
             # Always display brief usage summary after each iteration
-            print_iteration_usage(percentage, total_used, limit)
+            print_iteration_usage(percentage, total_used, limit, cost_usd=cost_usd)
 
             # Calculate time until window resets (for rolling windows, oldest data ages out)
             from datetime import datetime, timezone
