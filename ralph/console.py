@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from rich.console import Console
 from rich.panel import Panel
@@ -899,3 +899,83 @@ def print_usage_history(
         console.print(f"  Total cost: [green]{_format_cost(total_cost)}[/green]")
     console.print(f"  Windows with high usage (>80%): [yellow]{high_count}[/yellow]")
     console.print(f"  Windows that exceeded limit: [red]{exceeded_count}[/red]")
+
+
+def print_reeval_header(iteration: int) -> None:
+    """Print the header for a re-evaluation iteration."""
+    console.print()
+    console.print(Panel(
+        "[bold cyan]PRD Health Check[/bold cyan]\n"
+        f"Running periodic re-evaluation at iteration {iteration}",
+        title="Re-Evaluation",
+        style="cyan",
+    ))
+
+
+def print_reeval_changes(
+    applied_changes: list[str],
+    rejected_changes: list[tuple[Any, str]],
+    summary: str,
+) -> None:
+    """
+    Print the results of a re-evaluation.
+
+    Args:
+        applied_changes: List of applied change descriptions
+        rejected_changes: List of (change, reason) tuples for rejected changes
+        summary: Summary from the re-evaluation
+    """
+    console.print()
+
+    if not applied_changes and not rejected_changes:
+        console.print(Panel(
+            "[bold green]No changes needed[/bold green]\n\n"
+            f"[dim]{summary}[/dim]" if summary else "",
+            title="Re-Evaluation Complete",
+            style="green",
+        ))
+        return
+
+    # Build content
+    content_lines = []
+
+    if summary:
+        content_lines.append(f"[dim]{summary}[/dim]\n")
+
+    if applied_changes:
+        content_lines.append("[bold green]Applied Changes:[/bold green]")
+        for change_desc in applied_changes:
+            content_lines.append(f"  [green]+[/green] {change_desc}")
+        content_lines.append("")
+
+    if rejected_changes:
+        content_lines.append("[bold yellow]Rejected Changes (safeguards):[/bold yellow]")
+        for change, reason in rejected_changes:
+            action = change.action.value if hasattr(change, 'action') else str(change)
+            story_id = change.story_id if hasattr(change, 'story_id') else ''
+            content_lines.append(f"  [yellow]-[/yellow] {action} {story_id}: {reason}")
+
+    style = "green" if not rejected_changes else "yellow"
+    console.print(Panel(
+        "\n".join(content_lines),
+        title="Re-Evaluation Complete",
+        style=style,
+    ))
+
+
+def print_reeval_skipped(reason: str) -> None:
+    """Print a message when re-evaluation is skipped."""
+    console.print()
+    console.print(f"[dim]Re-evaluation skipped: {reason}[/dim]")
+
+
+def print_reeval_error(error: str) -> None:
+    """Print an error message from re-evaluation."""
+    console.print()
+    console.print(Panel(
+        f"[bold yellow]Re-evaluation encountered an error[/bold yellow]\n\n"
+        f"{error}\n\n"
+        "[dim]Continuing with main loop...[/dim]",
+        title="Re-Evaluation Warning",
+        style="yellow",
+    ))

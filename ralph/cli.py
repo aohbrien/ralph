@@ -167,6 +167,16 @@ def run(
         "--cost-tracking/--no-cost-tracking",
         help="Enable/disable cost tracking display",
     ),
+    reeval_interval: int = typer.Option(
+        10,
+        "--reeval-interval",
+        help="Run PRD re-evaluation every N iterations (0 to disable)",
+    ),
+    no_reeval: bool = typer.Option(
+        False,
+        "--no-reeval",
+        help="Disable PRD re-evaluation entirely",
+    ),
     debug: Optional[Path] = typer.Option(
         None,
         "--debug",
@@ -314,6 +324,8 @@ def run(
         pacing_threshold_2=pacing_threshold_2,
         pacing_threshold_3=pacing_threshold_3,
         five_hour_limit=five_hour_limit_value,
+        reeval_interval=reeval_interval,
+        no_reeval=no_reeval,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -651,6 +663,16 @@ def resume(
         "--limit-mode",
         help="Limit detection mode: plan, p90, or hybrid",
     ),
+    reeval_interval: int = typer.Option(
+        10,
+        "--reeval-interval",
+        help="Run PRD re-evaluation every N iterations (0 to disable)",
+    ),
+    no_reeval: bool = typer.Option(
+        False,
+        "--no-reeval",
+        help="Disable PRD re-evaluation entirely",
+    ),
     debug: Optional[Path] = typer.Option(
         None,
         "--debug",
@@ -722,6 +744,8 @@ def resume(
         pacing_threshold_2=pacing_threshold_2,
         pacing_threshold_3=pacing_threshold_3,
         five_hour_limit=five_hour_limit_value,
+        reeval_interval=reeval_interval,
+        no_reeval=no_reeval,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
