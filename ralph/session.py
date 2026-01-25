@@ -191,7 +191,11 @@ def _read_registry_locked(lock_file: Path) -> tuple[SessionRegistry, Any]:
         f = open(lock_file, "w+", encoding="utf-8")
 
     # Acquire exclusive lock (blocking)
+    lock_start = time.time()
+    logger.debug(f"Acquiring lock on {lock_file}...")
     fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    lock_time = time.time() - lock_start
+    logger.debug(f"Lock acquired in {lock_time:.3f}s")
 
     # Read current content
     f.seek(0)
@@ -201,6 +205,7 @@ def _read_registry_locked(lock_file: Path) -> tuple[SessionRegistry, Any]:
         try:
             data = json.loads(content)
             registry = SessionRegistry.from_dict(data)
+            logger.debug(f"Loaded registry with {len(registry.sessions)} sessions")
         except json.JSONDecodeError:
             logger.warning("Corrupted lock file, starting fresh")
             registry = SessionRegistry()
@@ -216,15 +221,19 @@ def _write_registry_and_unlock(
     """Write the registry and release the lock."""
     try:
         # Truncate and write new content
+        logger.debug("Writing registry...")
         f.seek(0)
         f.truncate()
         json.dump(registry.to_dict(), f, indent=2)
         f.write("\n")
         f.flush()
+        logger.debug("Registry written")
     finally:
         # Release lock and close file
+        logger.debug("Releasing lock...")
         fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         f.close()
+        logger.debug("Lock released")
 
 
 def register_session(
@@ -313,6 +322,9 @@ def update_heartbeat(
     if pid is None:
         pid = os.getpid()
 
+    start_time = time.time()
+    logger.debug(f"update_heartbeat starting for PID={pid}")
+
     try:
         registry, f = _read_registry_locked(lock_file)
 
@@ -321,12 +333,17 @@ def update_heartbeat(
             session.last_heartbeat = datetime.now(timezone.utc).isoformat()
             registry.add_session(session)
             _write_registry_and_unlock(registry, lock_file, f)
+            elapsed = time.time() - start_time
+            logger.debug(f"update_heartbeat completed in {elapsed:.3f}s")
             return True
         else:
             _write_registry_and_unlock(registry, lock_file, f)
+            elapsed = time.time() - start_time
+            logger.debug(f"update_heartbeat: session not found, completed in {elapsed:.3f}s")
             return False
     except (OSError, IOError) as e:
-        logger.warning(f"Failed to update heartbeat: {e}")
+        elapsed = time.time() - start_time
+        logger.warning(f"Failed to update heartbeat after {elapsed:.3f}s: {e}")
         return False
 
 

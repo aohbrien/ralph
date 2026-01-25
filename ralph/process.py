@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import pty
 import select
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable
+
+logger = logging.getLogger("ralph.process")
 
 
 class Tool(Enum):
@@ -61,17 +65,43 @@ class ManagedProcess:
         return self._interrupted
 
     def terminate(self) -> None:
-        """Terminate the subprocess if running."""
+        """Terminate the subprocess and its entire process group."""
         self._interrupted = True
         if self._process is not None and self._process.poll() is None:
-            # Try SIGTERM first
-            self._process.terminate()
+            pid = self._process.pid
+            logger.debug(f"Terminating process group for PID={pid}")
+
+            try:
+                # Send SIGTERM to the entire process group
+                # The process was started with start_new_session=True,
+                # so its PID is also the process group ID
+                os.killpg(pid, signal.SIGTERM)
+                logger.debug(f"Sent SIGTERM to process group {pid}")
+            except (ProcessLookupError, PermissionError) as e:
+                logger.debug(f"Could not send SIGTERM to process group: {e}")
+                # Fall back to terminating just the process
+                try:
+                    self._process.terminate()
+                except ProcessLookupError:
+                    pass
+
             try:
                 self._process.wait(timeout=5)
+                logger.debug(f"Process {pid} terminated gracefully")
             except subprocess.TimeoutExpired:
-                # Force kill if it doesn't respond
-                self._process.kill()
+                logger.debug(f"Process {pid} did not terminate, sending SIGKILL")
+                # Force kill the entire process group
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                    logger.debug(f"Sent SIGKILL to process group {pid}")
+                except (ProcessLookupError, PermissionError):
+                    # Fall back to killing just the process
+                    try:
+                        self._process.kill()
+                    except ProcessLookupError:
+                        pass
                 self._process.wait()
+                logger.debug(f"Process {pid} killed")
 
     def reset(self) -> None:
         """Reset the interrupted state for a new run."""
@@ -86,6 +116,24 @@ _current_process: ManagedProcess | None = None
 def get_current_process() -> ManagedProcess | None:
     """Get the current managed process, if any."""
     return _current_process
+
+
+def cleanup_current_process() -> None:
+    """
+    Clean up the current running process, if any.
+
+    This is called on unexpected exits to ensure Claude doesn't keep running.
+    """
+    global _current_process
+    if _current_process is not None:
+        logger.debug("cleanup_current_process: terminating orphaned process")
+        _current_process.terminate()
+        _current_process = None
+
+
+# Register atexit handler to clean up on unexpected exits
+import atexit
+atexit.register(cleanup_current_process)
 
 
 def stream_process(
@@ -115,111 +163,182 @@ def stream_process(
     """
     global _current_process
 
-    import time
     start_time = time.monotonic()
     timed_out = False
 
+    logger.debug(f"stream_process starting: cmd={cmd}, cwd={cwd}, timeout={timeout}")
+
     # Create a pseudo-terminal for the subprocess
-    master_fd, slave_fd = pty.openpty()
+    leader_fd, follower_fd = pty.openpty()
+    logger.debug(f"PTY created: leader_fd={leader_fd}, follower_fd={follower_fd}")
 
     try:
+        logger.debug("Spawning subprocess...")
         process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE if input_text else None,
-            stdout=slave_fd,
-            stderr=slave_fd,  # Merge stderr into stdout (like 2>&1)
+            stdout=follower_fd,
+            stderr=follower_fd,  # Merge stderr into stdout (like 2>&1)
             cwd=cwd,
             close_fds=True,
             # Start in new process group for clean termination
             start_new_session=True,
         )
+        logger.debug(f"Subprocess spawned with PID={process.pid}")
 
         # Register with managed process if provided
         if managed_process is not None:
             managed_process.process = process
             _current_process = managed_process
 
-        # Close slave in parent - child has it
-        os.close(slave_fd)
+        # Close follower in parent - child has it
+        os.close(follower_fd)
+        logger.debug("Closed follower_fd in parent")
 
         output_buffer: list[str] = []
 
         # Write input and close stdin
         if input_text and process.stdin:
+            logger.debug(f"Writing {len(input_text)} bytes to stdin")
             try:
                 process.stdin.write(input_text.encode())
                 process.stdin.close()
+                logger.debug("Stdin written and closed")
             except BrokenPipeError:
+                logger.debug("BrokenPipeError writing to stdin")
                 pass
 
-        # Set master to non-blocking
-        os.set_blocking(master_fd, False)
+        # Set leader to non-blocking
+        os.set_blocking(leader_fd, False)
+        logger.debug("Starting read loop...")
+
+        loop_count = 0
+        last_log_time = time.monotonic()
+        total_bytes_read = 0
+        first_byte_time: float | None = None
 
         # Read output in real-time
         while True:
+            loop_count += 1
+            elapsed = time.monotonic() - start_time
+
+            # Log progress every 5 seconds to show we're not hung
+            if time.monotonic() - last_log_time >= 5.0:
+                # Check process state more thoroughly
+                poll_result = process.poll()
+                try:
+                    # Try to get more info about the process
+                    import subprocess as sp
+                    ps_result = sp.run(
+                        ["ps", "-o", "state=,wchan=", "-p", str(process.pid)],
+                        capture_output=True, text=True, timeout=1
+                    )
+                    ps_info = ps_result.stdout.strip() if ps_result.returncode == 0 else "N/A"
+                except Exception:
+                    ps_info = "N/A"
+
+                logger.debug(
+                    f"Read loop: iteration={loop_count}, elapsed={elapsed:.1f}s, "
+                    f"bytes_read={total_bytes_read}, process_poll={poll_result}, "
+                    f"ps_state={ps_info}, first_byte={'%.1fs' % first_byte_time if first_byte_time else 'waiting'}"
+                )
+                last_log_time = time.monotonic()
             # Check if there's data to read
             try:
-                readable, _, _ = select.select([master_fd], [], [], 0.1)
+                readable, _, _ = select.select([leader_fd], [], [], 0.1)
             except (ValueError, OSError):
                 break
 
             if readable:
                 try:
-                    chunk = os.read(master_fd, 4096)
+                    chunk = os.read(leader_fd, 4096)
                     if chunk:
+                        if first_byte_time is None:
+                            first_byte_time = time.monotonic() - start_time
+                            logger.debug(f"First output received after {first_byte_time:.1f}s")
+                        total_bytes_read += len(chunk)
                         text = chunk.decode(errors="replace")
                         output_buffer.append(text)
                         if on_output:
                             on_output(text)
                     else:
                         # EOF
+                        logger.debug(f"EOF on leader_fd after {total_bytes_read} bytes")
                         break
                 except OSError as e:
                     if e.errno == errno.EIO:
-                        # EIO means the slave was closed (process ended)
+                        # EIO means the follower was closed (process ended)
+                        logger.debug(f"EIO on leader_fd (follower closed) after {total_bytes_read} bytes")
                         break
                     raise
 
             # Check if externally interrupted
             if managed_process is not None and managed_process.interrupted:
+                logger.debug("External interrupt detected")
                 break
 
             # Check for timeout
             if timeout is not None and (time.monotonic() - start_time) >= timeout:
+                logger.debug(f"Timeout reached after {elapsed:.1f}s")
                 timed_out = True
-                # Terminate the process
+                # Terminate the entire process group
                 if process.poll() is None:
-                    process.terminate()
+                    pid = process.pid
+                    logger.debug(f"Terminating process group {pid} due to timeout...")
+                    try:
+                        os.killpg(pid, signal.SIGTERM)
+                        logger.debug(f"Sent SIGTERM to process group {pid}")
+                    except (ProcessLookupError, PermissionError) as e:
+                        logger.debug(f"Could not SIGTERM process group: {e}")
+                        try:
+                            process.terminate()
+                        except ProcessLookupError:
+                            pass
                     try:
                         process.wait(timeout=5)
+                        logger.debug("Process terminated gracefully")
                     except subprocess.TimeoutExpired:
-                        process.kill()
+                        logger.debug("Process did not terminate, sending SIGKILL...")
+                        try:
+                            os.killpg(pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            try:
+                                process.kill()
+                            except ProcessLookupError:
+                                pass
                         process.wait()
+                        logger.debug("Process killed")
                 break
 
             # Check if process has ended
             if process.poll() is not None:
+                logger.debug(f"Process ended with code={process.returncode}, draining buffer...")
                 # Do one more read to get any remaining data
                 try:
                     while True:
-                        chunk = os.read(master_fd, 4096)
+                        chunk = os.read(leader_fd, 4096)
                         if not chunk:
                             break
+                        total_bytes_read += len(chunk)
                         text = chunk.decode(errors="replace")
                         output_buffer.append(text)
                         if on_output:
                             on_output(text)
                 except OSError:
                     pass
+                logger.debug(f"Buffer drained, total_bytes_read={total_bytes_read}")
                 break
 
         # Wait for process to fully terminate
+        logger.debug("Waiting for process to fully terminate...")
         process.wait()
+        logger.debug(f"Process terminated with returncode={process.returncode}")
 
     finally:
-        # Clean up master fd
+        # Clean up leader fd
         try:
-            os.close(master_fd)
+            os.close(leader_fd)
+            logger.debug("Closed leader_fd")
         except OSError:
             pass
         # Clear global reference
@@ -228,6 +347,14 @@ def stream_process(
 
     full_output = "".join(output_buffer)
     was_interrupted = managed_process is not None and managed_process.interrupted
+    total_time = time.monotonic() - start_time
+
+    logger.debug(
+        f"stream_process complete: returncode={process.returncode}, "
+        f"output_len={len(full_output)}, interrupted={was_interrupted}, "
+        f"timed_out={timed_out}, total_time={total_time:.1f}s"
+    )
+
     return ProcessResult(
         output=full_output,
         return_code=process.returncode or 0,
@@ -293,17 +420,14 @@ def run_tool_with_prompt(
         ProcessResult with output and completion status
     """
     if tool == Tool.CLAUDE:
-        base_cmd = "claude --dangerously-skip-permissions --print"
+        cmd = ["claude", "--dangerously-skip-permissions", "--print"]
     else:  # Tool.AMP
-        base_cmd = "amp --dangerously-allow-all"
+        cmd = ["amp", "--dangerously-allow-all"]
 
-    # Use bash with tee /dev/stderr for real-time streaming display
-    # This matches the working bash implementation: command 2>&1 | tee /dev/stderr
-    # tee writes to stderr for immediate unbuffered display while stdout captures output
-    bash_cmd = f"{base_cmd} 2>&1 | tee /dev/stderr"
+    logger.debug(f"run_tool_with_prompt: cmd={cmd}, prompt_len={len(prompt)}")
 
     return stream_process(
-        cmd=["bash", "-c", bash_cmd],
+        cmd=cmd,
         input_text=prompt,
         on_output=on_output,
         cwd=cwd,

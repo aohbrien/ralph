@@ -167,17 +167,35 @@ def run(
         "--cost-tracking/--no-cost-tracking",
         help="Enable/disable cost tracking display",
     ),
+    debug: Optional[Path] = typer.Option(
+        None,
+        "--debug",
+        help="Enable debug logging to specified file (e.g., --debug output.log)",
+    ),
 ) -> None:
     """Run the Ralph autonomous agent loop."""
+    import logging
+    import time
+    from ralph.logging_config import setup_logging
     from ralph.usage import check_usage_before_run
 
+    # Configure debug logging if requested
+    setup_logging(debug=debug is not None, log_file=debug)
+    logger = logging.getLogger("ralph.cli")
+
+    startup_start = time.monotonic()
+    logger.debug("=== Ralph startup beginning ===")
+
     # Validate PRD path
+    logger.debug(f"Resolving PRD path: {prd}")
     prd_path = prd.resolve()
     if not prd_path.exists():
         print_error(f"PRD file not found: {prd_path}")
         raise typer.Exit(1)
+    logger.debug(f"PRD path resolved: {prd_path}")
 
     # Parse tool
+    logger.debug(f"Parsing tool: {tool}")
     try:
         tool_enum = Tool(tool.lower())
     except ValueError:
@@ -185,13 +203,17 @@ def run(
         raise typer.Exit(1)
 
     # Load PRD
+    logger.debug("Loading PRD file...")
+    prd_load_start = time.monotonic()
     try:
         prd_obj = PRD.from_file(prd_path)
     except Exception as e:
         print_error(f"Failed to parse PRD: {e}")
         raise typer.Exit(1)
+    logger.debug(f"PRD loaded in {time.monotonic() - prd_load_start:.3f}s")
 
     # Parse limit mode
+    logger.debug(f"Parsing limit mode: {limit_mode}")
     try:
         limit_mode_enum = LimitMode(limit_mode.lower())
     except ValueError:
@@ -199,12 +221,19 @@ def run(
         raise typer.Exit(1)
 
     # Get plan limits based on limit mode
+    logger.debug("Getting plan limits...")
+    plan_start = time.monotonic()
     current_plan = get_plan()
+    logger.debug(f"Current plan: {current_plan}")
     limits = get_effective_limit(plan=current_plan, limit_mode=limit_mode_enum)
+    logger.debug(f"Plan limits retrieved in {time.monotonic() - plan_start:.3f}s: {limits}")
 
     # Pre-flight usage check (unless ignored)
     if not ignore_limits:
+        logger.debug("Running preflight usage check...")
+        preflight_start = time.monotonic()
         preflight = check_usage_before_run(five_hour_limit=limits["5hour_tokens"])
+        logger.debug(f"Preflight check completed in {time.monotonic() - preflight_start:.3f}s")
 
         if preflight.should_block and strict:
             # Block the run if >90% used and --strict is enabled
@@ -236,7 +265,10 @@ def run(
 
     # Check for existing state and prompt user if not resuming
     if not resume:
+        logger.debug("Checking for existing state...")
+        state_start = time.monotonic()
         existing_state = load_state(prd_path.parent)
+        logger.debug(f"State check completed in {time.monotonic() - state_start:.3f}s")
         if existing_state:
             print_info(
                 f"Found previous run state (iteration {existing_state.last_iteration}, "
@@ -262,6 +294,9 @@ def run(
 
     # Get plan limit for adaptive pacing (always use the limit, even if ignore_limits)
     five_hour_limit_value = limits["5hour_tokens"]
+
+    logger.debug(f"=== Startup completed in {time.monotonic() - startup_start:.3f}s ===")
+    logger.debug(f"Starting run_ralph with max_iterations={max_iterations}, timeout={timeout_seconds}s")
 
     # Run the main loop
     result = run_ralph(
@@ -616,8 +651,17 @@ def resume(
         "--limit-mode",
         help="Limit detection mode: plan, p90, or hybrid",
     ),
+    debug: Optional[Path] = typer.Option(
+        None,
+        "--debug",
+        help="Enable debug logging to specified file (e.g., --debug output.log)",
+    ),
 ) -> None:
     """Resume a previously interrupted run."""
+    from ralph.logging_config import setup_logging
+
+    # Configure debug logging if requested
+    setup_logging(debug=debug is not None, log_file=debug)
     # Validate PRD path
     prd_path = prd.resolve()
     if not prd_path.exists():

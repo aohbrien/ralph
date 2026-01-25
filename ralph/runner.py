@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import signal
 import time
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
 from typing import Callable, cast
+
+logger = logging.getLogger("ralph.runner")
 
 from ralph.archive import handle_branch_change
 from ralph.console import (
@@ -226,9 +229,13 @@ This signals to Ralph that the story is done and it should move to the next iter
 
     def _signal_handler(self, signum: int, frame: FrameType | None) -> None:
         """Handle SIGINT and SIGTERM for graceful shutdown."""
+        sig_name = signal.Signals(signum).name
+        logger.debug(f"Signal {sig_name} received, initiating graceful shutdown...")
         self._interrupted = True
         # Terminate the subprocess if running
+        logger.debug("Terminating subprocess...")
         self._managed_process.terminate()
+        logger.debug("Subprocess termination initiated")
 
     def _install_signal_handlers(self) -> None:
         """Install signal handlers for graceful shutdown."""
@@ -291,12 +298,12 @@ This signals to Ralph that the story is done and it should move to the next iter
 
     def _create_output_handler(self) -> Callable[[str], None]:
         """Create a handler for streaming output."""
-        import sys
+        import os
         def handler(text: str) -> None:
-            # Write to stderr for unbuffered real-time output (like bash's tee /dev/stderr)
-            # This avoids buffering issues with stdout and Typer/Rich interference
-            sys.stderr.write(text)
-            sys.stderr.flush()
+            # Write directly to fd 2 (stderr) for unbuffered real-time output
+            # This bypasses Python's sys.stderr which can be buffered or intercepted by Rich/Typer
+            # This is equivalent to what `tee /dev/stderr` was doing before
+            os.write(2, text.encode())
         return handler
 
     def _display_tasks(self) -> None:
@@ -327,6 +334,7 @@ This signals to Ralph that the story is done and it should move to the next iter
             Usage percentage (0-100), or None if usage tracking is unavailable.
         """
         try:
+            logger.debug("Getting usage percentage...")
             from ralph.config import get_plan, get_plan_limits
             from ralph.usage import get_5hour_window_usage
 
@@ -339,14 +347,19 @@ This signals to Ralph that the story is done and it should move to the next iter
                 limit = limits["5hour_tokens"]
 
             if limit <= 0:
+                logger.debug("Limit is 0, returning None")
                 return None
 
+            logger.debug("Fetching 5-hour window usage...")
             usage = get_5hour_window_usage()
             total_used = usage.rate_limited_tokens  # Excludes cache reads
+            logger.debug(f"Total used: {total_used} tokens")
 
             # Calculate remaining budget and divide across active sessions
             remaining = max(0, limit - total_used)
+            logger.debug("Getting session budget...")
             session_budget, num_sessions = get_budget_for_session(remaining)
+            logger.debug(f"Session budget: {session_budget}, num_sessions: {num_sessions}")
 
             # Calculate this session's effective limit (used + session share of remaining)
             # This ensures each session sees their fair share of the remaining budget
@@ -357,9 +370,11 @@ This signals to Ralph that the story is done and it should move to the next iter
 
             # Calculate percentage based on effective limit
             percentage = (total_used / effective_limit) * 100
+            logger.debug(f"Usage percentage: {percentage:.1f}%")
             return min(percentage, 100.0)
-        except Exception:
+        except Exception as e:
             # If usage tracking fails, don't block the run
+            logger.debug(f"Usage tracking failed: {e}")
             return None
 
     def _calculate_adaptive_delay(self, usage_percentage: float | None) -> tuple[float, float]:
@@ -481,10 +496,14 @@ This signals to Ralph that the story is done and it should move to the next iter
         Returns:
             Tuple of (ProcessResult from tool execution, story ID or None)
         """
+        logger.debug(f"run_iteration({iteration}) starting")
+
         # Reload PRD to get latest state
+        logger.debug("Loading PRD...")
         prd = self._load_prd()
         next_story = prd.get_next_story()
         story_id = next_story.id if next_story else None
+        logger.debug(f"Next story: {story_id}")
 
         # Print iteration header
         print_iteration_header(iteration, self.max_iterations, next_story)
@@ -504,10 +523,12 @@ This signals to Ralph that the story is done and it should move to the next iter
             print_info(f"Running {self.tool.value} for story: {next_story.id}")
 
         # Start conversation watcher for real-time log display
+        logger.debug("Starting conversation watcher...")
         watcher = ConversationWatcher(self.base_dir)
         watcher.start()
 
         # Run the tool with the generated prompt
+        logger.debug(f"Running {self.tool.value} with timeout={self.timeout}s...")
         self._managed_process.reset()
         output_handler = self._create_output_handler()
         try:
@@ -520,9 +541,16 @@ This signals to Ralph that the story is done and it should move to the next iter
                 timeout=self.timeout,
             )
         finally:
+            logger.debug("Stopping conversation watcher...")
             watcher.stop()
 
         console.print()  # Newline after output
+
+        logger.debug(
+            f"run_iteration({iteration}) complete: "
+            f"returncode={result.return_code}, completed={result.completed}, "
+            f"timed_out={result.timed_out}, interrupted={result.interrupted}"
+        )
 
         if self.verbose:
             print_info(f"Tool exited with code: {result.return_code}")
@@ -598,6 +626,7 @@ This signals to Ralph that the story is done and it should move to the next iter
         """
         # Install signal handlers
         self._install_signal_handlers()
+        logger.debug("Signal handlers installed")
 
         try:
             # Use SessionManager for cross-session coordination
@@ -607,11 +636,20 @@ This signals to Ralph that the story is done and it should move to the next iter
                     print_info(f"Registered session (PID={session.pid})")
                 return self._run_loop()
         finally:
+            logger.debug("Cleaning up...")
+            # Ensure subprocess is terminated
+            if self._managed_process.process is not None:
+                logger.debug("Terminating any remaining subprocess...")
+                self._managed_process.terminate()
             self._restore_signal_handlers()
+            logger.debug("Cleanup complete")
 
     def _run_loop(self) -> bool | int:
         """Internal run loop, separated for signal handler cleanup."""
+        logger.debug("_run_loop starting")
+
         # Load initial PRD
+        logger.debug("Loading initial PRD...")
         prd = self._load_prd()
 
         # Handle resume if requested
@@ -660,6 +698,7 @@ This signals to Ralph that the story is done and it should move to the next iter
         # Main loop
         for iteration in range(self._start_iteration, self.max_iterations + 1):
             self._current_iteration = iteration
+            logger.debug(f"=== Starting iteration {iteration}/{self.max_iterations} ===")
 
             # Check for interrupt before starting iteration
             if self._interrupted:
@@ -671,6 +710,13 @@ This signals to Ralph that the story is done and it should move to the next iter
             # Run iteration with retry logic
             result, story_id = self._run_iteration_with_retry(iteration)
 
+            # Check for interrupt after iteration - do this FIRST before any slow operations
+            if self._interrupted or result.interrupted:
+                prd = self._load_prd()
+                completed, total = prd.get_progress()
+                print_interrupt(iteration, completed, total)
+                return 130  # Standard exit code for SIGINT
+
             # Save iteration log
             self._save_iteration_log(iteration, story_id, result.output)
 
@@ -679,26 +725,25 @@ This signals to Ralph that the story is done and it should move to the next iter
             self._save_run_state(iteration, story_id, len(prd.user_stories))
 
             # Display current usage after each iteration (with warnings if thresholds exceeded)
-            self._display_iteration_usage()
-
-            # Check for interrupt after iteration
-            if self._interrupted or result.interrupted:
-                prd = self._load_prd()
-                completed, total = prd.get_progress()
-                print_interrupt(iteration, completed, total)
-                return 130  # Standard exit code for SIGINT
+            # Skip if interrupted to avoid slow usage parsing during shutdown
+            if not self._interrupted:
+                self._display_iteration_usage()
 
             # Check for timeout - log and continue to next iteration (no retry on timeout)
             if result.timed_out:
                 print_timeout(iteration)
                 # Continue to next iteration rather than stopping
                 if iteration < self.max_iterations:
+                    logger.debug("Calculating adaptive pacing after timeout...")
                     delay = self._apply_adaptive_pacing()
+                    logger.debug(f"Sleeping for {delay:.1f}s between iterations...")
                     if self.verbose:
                         print_info(f"Waiting {delay:.1f}s before next iteration...")
                     time.sleep(delay)
                     # Update session heartbeat during delay
+                    logger.debug("Updating session heartbeat...")
                     update_heartbeat()
+                    logger.debug("Heartbeat updated")
                 continue
 
             # Note: result.completed means the story signaled completion with <promise>COMPLETE</promise>
@@ -713,12 +758,16 @@ This signals to Ralph that the story is done and it should move to the next iter
 
             # Wait before next iteration (unless this was the last one)
             if iteration < self.max_iterations:
+                logger.debug("Calculating adaptive pacing...")
                 delay = self._apply_adaptive_pacing()
+                logger.debug(f"Sleeping for {delay:.1f}s between iterations...")
                 if self.verbose:
                     print_info(f"Waiting {delay:.1f}s before next iteration...")
                 time.sleep(delay)
                 # Update session heartbeat during delay
+                logger.debug("Updating session heartbeat...")
                 update_heartbeat()
+                logger.debug("Heartbeat updated")
 
         # Max iterations reached without completion
         print_max_iterations_reached(self.max_iterations)

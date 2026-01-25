@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 # Default Claude projects directory
 DEFAULT_CLAUDE_DIR = Path.home() / ".claude" / "projects"
+
+# Cache for parsed session records to avoid re-parsing during startup
+# Key: (claude_dir, since_timestamp_or_none), Value: (records, cache_time)
+_session_cache: dict[tuple[str, float | None], tuple[list["UsageRecord"], float]] = {}
+_SESSION_CACHE_TTL = 30.0  # Cache valid for 30 seconds
 
 
 @dataclass
@@ -68,6 +74,7 @@ class UsageRecord:
 
 def discover_session_files(
     claude_dir: Path | None = None,
+    since: datetime | None = None,
 ) -> list[Path]:
     """
     Discover all Claude session JSONL files.
@@ -75,23 +82,45 @@ def discover_session_files(
     Args:
         claude_dir: Path to Claude projects directory.
                    Defaults to ~/.claude/projects/
+        since: If provided, only return files modified after this timestamp.
 
     Returns:
         List of paths to JSONL session files, sorted by modification time (newest first).
     """
+    start_time = time.monotonic()
+
     if claude_dir is None:
         claude_dir = DEFAULT_CLAUDE_DIR
+
+    logger.debug(f"discover_session_files: scanning {claude_dir}")
 
     if not claude_dir.exists():
         logger.debug(f"Claude directory not found: {claude_dir}")
         return []
 
     # Find all .jsonl files in project subdirectories
+    glob_start = time.monotonic()
     jsonl_files = list(claude_dir.glob("*/*.jsonl"))
+    total_files = len(jsonl_files)
+    logger.debug(f"Glob found {total_files} files in {time.monotonic() - glob_start:.3f}s")
+
+    # Filter by modification time if 'since' is provided
+    # This is a major optimization - skip files that haven't been touched since the cutoff
+    if since is not None:
+        since_timestamp = since.timestamp()
+        filter_start = time.monotonic()
+        jsonl_files = [f for f in jsonl_files if f.stat().st_mtime >= since_timestamp]
+        logger.debug(
+            f"Filtered to {len(jsonl_files)}/{total_files} files modified since {since} "
+            f"in {time.monotonic() - filter_start:.3f}s"
+        )
 
     # Sort by modification time, newest first
+    sort_start = time.monotonic()
     jsonl_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    logger.debug(f"Sorted files in {time.monotonic() - sort_start:.3f}s")
 
+    logger.debug(f"discover_session_files completed in {time.monotonic() - start_time:.3f}s")
     return jsonl_files
 
 
@@ -242,8 +271,32 @@ def parse_all_sessions(
     Returns:
         List of UsageRecord objects sorted by timestamp (oldest first).
     """
-    session_files = discover_session_files(claude_dir)
+    global _session_cache
 
+    start_time = time.monotonic()
+
+    # Create cache key
+    dir_key = str(claude_dir) if claude_dir else str(DEFAULT_CLAUDE_DIR)
+    since_key = since.timestamp() if since else None
+    cache_key = (dir_key, since_key)
+
+    # Check cache
+    if cache_key in _session_cache:
+        cached_records, cache_time = _session_cache[cache_key]
+        if time.monotonic() - cache_time < _SESSION_CACHE_TTL:
+            logger.debug(
+                f"parse_all_sessions: cache hit, returning {len(cached_records)} records"
+            )
+            return cached_records
+        else:
+            # Cache expired
+            del _session_cache[cache_key]
+
+    logger.debug(f"parse_all_sessions: discovering session files (since={since})")
+    session_files = discover_session_files(claude_dir, since=since)
+    logger.debug(f"Found {len(session_files)} session files in {time.monotonic() - start_time:.3f}s")
+
+    parse_start = time.monotonic()
     records: list[UsageRecord] = []
     for file_path in session_files:
         for record in parse_session_file(file_path):
@@ -253,7 +306,22 @@ def parse_all_sessions(
     # Sort by timestamp, oldest first
     records.sort(key=lambda r: r.timestamp)
 
+    logger.debug(
+        f"Parsed {len(records)} records from {len(session_files)} files "
+        f"in {time.monotonic() - parse_start:.3f}s (total: {time.monotonic() - start_time:.3f}s)"
+    )
+
+    # Cache the results
+    _session_cache[cache_key] = (records, time.monotonic())
+
     return records
+
+
+def clear_session_cache() -> None:
+    """Clear the session parsing cache."""
+    global _session_cache
+    _session_cache.clear()
+    logger.debug("Session cache cleared")
 
 
 @dataclass
@@ -416,6 +484,10 @@ def get_5hour_window_usage(
     Returns:
         UsageAggregate for the 5-hour window ending at 'now'.
     """
+    import time
+    start_time = time.monotonic()
+    logger.debug("get_5hour_window_usage: starting...")
+
     if now is None:
         now = datetime.now(timezone.utc)
 
@@ -431,7 +503,12 @@ def get_5hour_window_usage(
     # Filter to window (parse_all_sessions uses 'since' but we want exact bounds)
     records = _filter_by_time_window(records, window_start, window_end)
 
-    return _aggregate_records(records, window_start, window_end)
+    result = _aggregate_records(records, window_start, window_end)
+    logger.debug(
+        f"get_5hour_window_usage completed in {time.monotonic() - start_time:.3f}s: "
+        f"{result.rate_limited_tokens} rate-limited tokens"
+    )
+    return result
 
 
 def get_weekly_window_usage(
@@ -510,6 +587,10 @@ def check_usage_before_run(
     Returns:
         PreflightCheck with usage status and recommendations.
     """
+    import time
+    start_time = time.monotonic()
+    logger.debug("check_usage_before_run: starting...")
+
     # Get current 5-hour window usage
     usage = get_5hour_window_usage(claude_dir=claude_dir, now=now)
 
@@ -527,6 +608,11 @@ def check_usage_before_run(
     # Determine warning and blocking thresholds
     should_warn = percentage > 70
     should_block = percentage > 90
+
+    logger.debug(
+        f"check_usage_before_run completed in {time.monotonic() - start_time:.3f}s: "
+        f"{percentage:.1f}% used, {tokens_remaining} tokens remaining"
+    )
 
     return PreflightCheck(
         current_usage=usage,
