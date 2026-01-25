@@ -381,6 +381,8 @@ def validate_changes(prd: PRD, changes: list[ReEvalChange]) -> ValidationResult:
 
     # Track which stories are being removed to detect conflicts
     stories_being_removed: set[str] = set()
+    # Track which stories are merge targets (protected from removal)
+    stories_being_merged_into: set[str] = set()
     approved_count = 0
 
     for change in changes:
@@ -411,6 +413,13 @@ def validate_changes(prd: PRD, changes: list[ReEvalChange]) -> ValidationResult:
             if current_removals >= max_removals:
                 result.rejected_changes.append(
                     (change, f"Removal limit reached (max {max_removals} to preserve {MIN_PENDING_STORIES} pending)")
+                )
+                continue
+
+            # Check if this story is a merge target (protected)
+            if change.story_id in stories_being_merged_into:
+                result.rejected_changes.append(
+                    (change, f"Cannot remove '{change.story_id}' which is a merge target")
                 )
                 continue
 
@@ -461,6 +470,8 @@ def validate_changes(prd: PRD, changes: list[ReEvalChange]) -> ValidationResult:
 
             result.approved_changes.append(change)
             stories_being_removed.add(change.story_id)
+            # Protect the merge target from subsequent removal
+            stories_being_merged_into.add(change.merge_into)
             logger.info(
                 f"Approved: Merge story '{change.story_id}' into '{change.merge_into}' - {change.reason}"
             )

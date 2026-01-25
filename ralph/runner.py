@@ -24,9 +24,11 @@ from ralph.console import (
     print_max_iterations_reached,
     print_pacing_adjustment,
     print_prd_status,
+    print_reeval_cancelled,
     print_reeval_changes,
     print_reeval_error,
     print_reeval_header,
+    print_reeval_proposed_changes,
     print_reeval_skipped,
     print_resume_info,
     print_retry,
@@ -36,6 +38,7 @@ from ralph.console import (
     print_usage_critical,
     print_usage_warning,
     print_warning,
+    prompt_reeval_confirmation,
 )
 from ralph.conversation import ConversationWatcher
 from ralph.prd import PRD, UserStory
@@ -84,6 +87,8 @@ class Runner:
         five_hour_limit: int | None = None,
         reeval_interval: int = DEFAULT_REEVAL_INTERVAL,
         no_reeval: bool = False,
+        reeval_confirm: bool = True,
+        reeval_dry_run: bool = False,
     ):
         self.prd_path = prd_path
         self.tool = tool
@@ -106,6 +111,8 @@ class Runner:
         # Re-evaluation configuration
         self.reeval_interval = reeval_interval
         self.no_reeval = no_reeval
+        self.reeval_confirm = reeval_confirm
+        self.reeval_dry_run = reeval_dry_run
 
         # Track last pacing multiplier to only log changes
         self._last_pacing_multiplier: float = 1.0
@@ -439,9 +446,46 @@ Ralph provides these commands to manage PRD state:
         # Validate proposed changes
         validation = validate_changes(prd, reeval_result.changes)
 
+        # Handle dry-run mode - show what would happen but don't apply
+        if self.reeval_dry_run:
+            print_reeval_proposed_changes(
+                validation.approved_changes,
+                validation.rejected_changes,
+                reeval_result.summary,
+                dry_run=True,
+            )
+            # Update state so we don't re-run at this iteration on resume
+            if self._run_state:
+                self._run_state.update_reeval(iteration)
+                save_state(self.base_dir, self._run_state)
+            return True
+
         # Apply approved changes
         applied_changes: list[str] = []
         if validation.approved_changes:
+            # Show proposed changes and ask for confirmation if enabled
+            if self.reeval_confirm:
+                print_reeval_proposed_changes(
+                    validation.approved_changes,
+                    validation.rejected_changes,
+                    reeval_result.summary,
+                    dry_run=False,
+                )
+                if not prompt_reeval_confirmation():
+                    print_reeval_cancelled()
+                    # Log that changes were cancelled
+                    append_reeval_to_progress(
+                        progress_path,
+                        reeval_result,
+                        validation,
+                        [],  # No changes applied
+                    )
+                    # Update state
+                    if self._run_state:
+                        self._run_state.update_reeval(iteration)
+                        save_state(self.base_dir, self._run_state)
+                    return True
+
             # Create a backup of the PRD before modifying
             backup_path = self.prd_path.with_suffix(".json.bak")
             try:
@@ -639,11 +683,22 @@ Ralph provides these commands to manage PRD state:
             # Always display brief usage summary after each iteration
             print_iteration_usage(percentage, total_used, limit, cost_usd=cost_usd)
 
-            # Calculate time until window resets (for rolling windows, oldest data ages out)
+            # Calculate time until oldest data ages out of the 5-hour window
             from datetime import datetime, timezone
 
             now = datetime.now(timezone.utc)
-            time_until_reset = _format_time_remaining(now + timedelta(hours=5), now)
+            time_remaining = usage.time_until_oldest_ages_out(timedelta(hours=5), now)
+
+            # Format time remaining
+            if time_remaining.total_seconds() <= 0:
+                time_until_reset = "now"
+            else:
+                hours = int(time_remaining.total_seconds() // 3600)
+                minutes = int((time_remaining.total_seconds() % 3600) // 60)
+                if hours > 0:
+                    time_until_reset = f"{hours}h {minutes}m"
+                else:
+                    time_until_reset = f"{minutes}m"
 
             # Show warning banners based on thresholds
             if percentage >= 90:
@@ -979,6 +1034,8 @@ def run_ralph(
     five_hour_limit: int | None = None,
     reeval_interval: int = DEFAULT_REEVAL_INTERVAL,
     no_reeval: bool = False,
+    reeval_confirm: bool = True,
+    reeval_dry_run: bool = False,
 ) -> bool | int:
     """
     Convenience function to run Ralph.
@@ -1000,6 +1057,8 @@ def run_ralph(
         five_hour_limit: Override 5-hour token limit (None = use plan limit)
         reeval_interval: Run PRD re-evaluation every N iterations (0 to disable)
         no_reeval: Disable PRD re-evaluation entirely
+        reeval_confirm: Require user confirmation before applying re-evaluation changes
+        reeval_dry_run: Show what changes would be made without applying them
 
     Returns:
         True if all stories were completed
@@ -1024,5 +1083,7 @@ def run_ralph(
         five_hour_limit=five_hour_limit,
         reeval_interval=reeval_interval,
         no_reeval=no_reeval,
+        reeval_confirm=reeval_confirm,
+        reeval_dry_run=reeval_dry_run,
     )
     return runner.run()

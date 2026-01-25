@@ -1054,3 +1054,202 @@ class TestStateTracking:
         restored = RunState.from_dict(data)
 
         assert restored.last_reeval_iteration == 10
+
+
+# =============================================================================
+# Test order-of-operations safeguards
+# =============================================================================
+
+
+class TestOrderOfOperationsSafeguards:
+    """Tests for order-of-operations bug fixes."""
+
+    def test_reject_remove_after_merge_into(self):
+        """Test that removing a story that is a merge target is rejected.
+
+        This tests the fix for the order-of-operations bug where:
+        [MERGE US-003 into US-002, REMOVE US-002] would both be approved,
+        causing loss of all merged content.
+        """
+        # Create PRD with enough pending stories
+        prd = create_test_prd([
+            {"id": "US-001", "title": "Completed", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 1, "passes": True},
+            {"id": "US-002", "title": "Pending 1", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 2, "passes": False},
+            {"id": "US-003", "title": "Pending 2", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 3, "passes": False},
+            {"id": "US-004", "title": "Pending 3", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 4, "passes": False},
+        ])
+
+        # The problematic order: merge first, then try to remove the target
+        changes = [
+            ReEvalChange(action=ChangeAction.MERGE, story_id="US-003",
+                        merge_into="US-002", reason="Merge into US-002"),
+            ReEvalChange(action=ChangeAction.REMOVE, story_id="US-002",
+                        reason="Try to remove merge target"),
+        ]
+
+        result = validate_changes(prd, changes)
+
+        # Merge should be approved
+        merge_approved = any(
+            c.action == ChangeAction.MERGE and c.story_id == "US-003"
+            for c in result.approved_changes
+        )
+        assert merge_approved, "Merge should be approved"
+
+        # Remove of merge target should be rejected
+        remove_rejected = any(
+            c.story_id == "US-002" and "merge target" in reason.lower()
+            for c, reason in result.rejected_changes
+        )
+        assert remove_rejected, "Remove of merge target should be rejected"
+
+    def test_allow_remove_non_merge_target(self):
+        """Test that removing a story that is NOT a merge target is still allowed."""
+        prd = create_test_prd([
+            {"id": "US-001", "title": "Completed", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 1, "passes": True},
+            {"id": "US-002", "title": "Pending 1", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 2, "passes": False},
+            {"id": "US-003", "title": "Pending 2", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 3, "passes": False},
+            {"id": "US-004", "title": "Pending 3", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 4, "passes": False},
+        ])
+
+        # Merge into US-004, remove US-002 (not the merge target)
+        changes = [
+            ReEvalChange(action=ChangeAction.MERGE, story_id="US-003",
+                        merge_into="US-004", reason="Merge into US-004"),
+            ReEvalChange(action=ChangeAction.REMOVE, story_id="US-002",
+                        reason="Remove different story"),
+        ]
+
+        result = validate_changes(prd, changes)
+
+        # Both should be approved (within removal limits)
+        assert len(result.approved_changes) == 2
+        assert len(result.rejected_changes) == 0
+
+    def test_multiple_merges_protect_all_targets(self):
+        """Test that multiple merges protect all their targets from removal."""
+        prd = create_test_prd([
+            {"id": "US-001", "title": "Pending 1", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 1, "passes": False},
+            {"id": "US-002", "title": "Pending 2", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 2, "passes": False},
+            {"id": "US-003", "title": "Pending 3", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 3, "passes": False},
+            {"id": "US-004", "title": "Pending 4", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 4, "passes": False},
+            {"id": "US-005", "title": "Pending 5", "description": "D",
+             "acceptanceCriteria": ["AC"], "priority": 5, "passes": False},
+        ])
+
+        # Two merges, then try to remove both targets
+        changes = [
+            ReEvalChange(action=ChangeAction.MERGE, story_id="US-001",
+                        merge_into="US-003", reason="Merge 1"),
+            ReEvalChange(action=ChangeAction.MERGE, story_id="US-002",
+                        merge_into="US-004", reason="Merge 2"),
+            ReEvalChange(action=ChangeAction.REMOVE, story_id="US-003",
+                        reason="Try to remove target 1"),
+            ReEvalChange(action=ChangeAction.REMOVE, story_id="US-004",
+                        reason="Try to remove target 2"),
+        ]
+
+        result = validate_changes(prd, changes)
+
+        # Both merges should be approved
+        merge_count = sum(1 for c in result.approved_changes if c.action == ChangeAction.MERGE)
+        assert merge_count == 2
+
+        # Both removes should be rejected
+        remove_rejected_count = sum(
+            1 for c, reason in result.rejected_changes
+            if c.action == ChangeAction.REMOVE and "merge target" in reason.lower()
+        )
+        assert remove_rejected_count == 2
+
+
+# =============================================================================
+# Test Runner confirmation and dry-run modes
+# =============================================================================
+
+
+class TestRunnerConfirmAndDryRun:
+    """Tests for Runner confirmation and dry-run configuration."""
+
+    def create_test_prd_file(self, tmpdir: str) -> Path:
+        """Create a test PRD file."""
+        prd_path = Path(tmpdir) / "prd.json"
+        prd_content = {
+            "project": "Test",
+            "branchName": "test",
+            "description": "Test project",
+            "userStories": [
+                {
+                    "id": "US-001",
+                    "title": "Story 1",
+                    "description": "First story",
+                    "acceptanceCriteria": ["AC1"],
+                    "priority": 1,
+                    "passes": False,
+                },
+                {
+                    "id": "US-002",
+                    "title": "Story 2",
+                    "description": "Second story",
+                    "acceptanceCriteria": ["AC1"],
+                    "priority": 2,
+                    "passes": False,
+                },
+            ],
+        }
+        prd_path.write_text(json.dumps(prd_content))
+        return prd_path
+
+    def test_runner_stores_confirm_config(self):
+        """Test that Runner stores reeval_confirm configuration."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prd_path = self.create_test_prd_file(tmpdir)
+
+            runner = Runner(
+                prd_path=prd_path,
+                reeval_confirm=False,
+            )
+
+            assert runner.reeval_confirm is False
+
+    def test_runner_stores_dry_run_config(self):
+        """Test that Runner stores reeval_dry_run configuration."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prd_path = self.create_test_prd_file(tmpdir)
+
+            runner = Runner(
+                prd_path=prd_path,
+                reeval_dry_run=True,
+            )
+
+            assert runner.reeval_dry_run is True
+
+    def test_runner_default_confirm_is_true(self):
+        """Test that reeval_confirm defaults to True."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prd_path = self.create_test_prd_file(tmpdir)
+
+            runner = Runner(prd_path=prd_path)
+
+            assert runner.reeval_confirm is True
+
+    def test_runner_default_dry_run_is_false(self):
+        """Test that reeval_dry_run defaults to False."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prd_path = self.create_test_prd_file(tmpdir)
+
+            runner = Runner(prd_path=prd_path)
+
+            assert runner.reeval_dry_run is False

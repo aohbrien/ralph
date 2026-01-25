@@ -177,6 +177,16 @@ def run(
         "--no-reeval",
         help="Disable PRD re-evaluation entirely",
     ),
+    reeval_confirm: bool = typer.Option(
+        True,
+        "--reeval-confirm/--no-reeval-confirm",
+        help="Require user confirmation before applying re-evaluation changes",
+    ),
+    reeval_dry_run: bool = typer.Option(
+        False,
+        "--reeval-dry-run",
+        help="Show what re-evaluation changes would be made without applying them",
+    ),
     debug: Optional[Path] = typer.Option(
         None,
         "--debug",
@@ -326,6 +336,8 @@ def run(
         five_hour_limit=five_hour_limit_value,
         reeval_interval=reeval_interval,
         no_reeval=no_reeval,
+        reeval_confirm=reeval_confirm,
+        reeval_dry_run=reeval_dry_run,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -673,6 +685,16 @@ def resume(
         "--no-reeval",
         help="Disable PRD re-evaluation entirely",
     ),
+    reeval_confirm: bool = typer.Option(
+        True,
+        "--reeval-confirm/--no-reeval-confirm",
+        help="Require user confirmation before applying re-evaluation changes",
+    ),
+    reeval_dry_run: bool = typer.Option(
+        False,
+        "--reeval-dry-run",
+        help="Show what re-evaluation changes would be made without applying them",
+    ),
     debug: Optional[Path] = typer.Option(
         None,
         "--debug",
@@ -746,6 +768,8 @@ def resume(
         five_hour_limit=five_hour_limit_value,
         reeval_interval=reeval_interval,
         no_reeval=no_reeval,
+        reeval_confirm=reeval_confirm,
+        reeval_dry_run=reeval_dry_run,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)

@@ -337,6 +337,7 @@ class UsageAggregate:
     message_count: int
     request_count: int
     cost_usd: float = 0.0
+    oldest_record_timestamp: datetime | None = None  # When the oldest record was created
 
     @property
     def total_input_tokens(self) -> int:
@@ -365,6 +366,42 @@ class UsageAggregate:
             + self.cache_creation_input_tokens
         )
 
+    def time_until_oldest_ages_out(
+        self,
+        window_duration: timedelta,
+        now: datetime | None = None,
+    ) -> timedelta:
+        """
+        Calculate time until the oldest record in this window ages out.
+
+        For a rolling window, records age out when they're older than
+        the window duration. This method calculates when the oldest
+        record will reach that age.
+
+        Args:
+            window_duration: Duration of the rolling window (e.g., 5 hours)
+            now: Current time (defaults to datetime.now(timezone.utc))
+
+        Returns:
+            Time remaining until oldest record ages out.
+            Returns timedelta(0) if no records or already aged out.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+
+        if self.oldest_record_timestamp is None:
+            return timedelta(0)
+
+        # When does the oldest record age out?
+        ages_out_at = self.oldest_record_timestamp + window_duration
+
+        # Time remaining
+        remaining = ages_out_at - now
+        if remaining.total_seconds() < 0:
+            return timedelta(0)
+
+        return remaining
+
 
 def _aggregate_records(
     records: list[UsageRecord],
@@ -387,6 +424,7 @@ def _aggregate_records(
     cache_creation = 0
     cache_read = 0
     cost_usd = 0.0
+    oldest_timestamp: datetime | None = None
 
     for record in records:
         input_tokens += record.input_tokens
@@ -394,6 +432,10 @@ def _aggregate_records(
         cache_creation += record.cache_creation_input_tokens
         cache_read += record.cache_read_input_tokens
         cost_usd += record.cost_usd
+
+        # Track the oldest record
+        if oldest_timestamp is None or record.timestamp < oldest_timestamp:
+            oldest_timestamp = record.timestamp
 
     # Each record is one message/request
     message_count = len(records)
@@ -409,6 +451,7 @@ def _aggregate_records(
         message_count=message_count,
         request_count=request_count,
         cost_usd=cost_usd,
+        oldest_record_timestamp=oldest_timestamp,
     )
 
 

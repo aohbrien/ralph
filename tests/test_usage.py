@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from ralph.usage import (
+    UsageAggregate,
     UsageRecord,
     _filter_by_time_window,
     _parse_timestamp,
@@ -1648,3 +1649,108 @@ class TestUsageAggregateProperties:
 
         assert aggregate.total_input_tokens == 0
         assert aggregate.total_tokens == 0
+
+
+class TestTimeUntilOldestAgesOut:
+    """Tests for UsageAggregate.time_until_oldest_ages_out method."""
+
+    def test_with_oldest_record_in_future(self):
+        """Test when oldest record hasn't aged out yet."""
+        now = datetime(2025, 1, 20, 15, 0, 0, tzinfo=timezone.utc)
+        oldest = now - timedelta(hours=3)  # 3 hours ago
+
+        aggregate = UsageAggregate(
+            window_start=now - timedelta(hours=5),
+            window_end=now,
+            input_tokens=1000,
+            output_tokens=500,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            message_count=1,
+            request_count=1,
+            oldest_record_timestamp=oldest,
+        )
+
+        # Oldest record ages out at: 3 hours ago + 5 hours = 2 hours from now
+        remaining = aggregate.time_until_oldest_ages_out(timedelta(hours=5), now)
+        assert remaining == timedelta(hours=2)
+
+    def test_with_oldest_record_almost_aged_out(self):
+        """Test when oldest record is about to age out."""
+        now = datetime(2025, 1, 20, 15, 0, 0, tzinfo=timezone.utc)
+        oldest = now - timedelta(hours=4, minutes=55)  # Almost 5 hours ago
+
+        aggregate = UsageAggregate(
+            window_start=now - timedelta(hours=5),
+            window_end=now,
+            input_tokens=1000,
+            output_tokens=500,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            message_count=1,
+            request_count=1,
+            oldest_record_timestamp=oldest,
+        )
+
+        remaining = aggregate.time_until_oldest_ages_out(timedelta(hours=5), now)
+        assert remaining == timedelta(minutes=5)
+
+    def test_with_oldest_record_already_aged_out(self):
+        """Test when oldest record has already aged out."""
+        now = datetime(2025, 1, 20, 15, 0, 0, tzinfo=timezone.utc)
+        oldest = now - timedelta(hours=6)  # 6 hours ago (> 5 hour window)
+
+        aggregate = UsageAggregate(
+            window_start=now - timedelta(hours=5),
+            window_end=now,
+            input_tokens=1000,
+            output_tokens=500,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            message_count=1,
+            request_count=1,
+            oldest_record_timestamp=oldest,
+        )
+
+        remaining = aggregate.time_until_oldest_ages_out(timedelta(hours=5), now)
+        assert remaining == timedelta(0)
+
+    def test_with_no_records(self):
+        """Test when there are no records."""
+        now = datetime(2025, 1, 20, 15, 0, 0, tzinfo=timezone.utc)
+
+        aggregate = UsageAggregate(
+            window_start=now - timedelta(hours=5),
+            window_end=now,
+            input_tokens=0,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            message_count=0,
+            request_count=0,
+            oldest_record_timestamp=None,  # No records
+        )
+
+        remaining = aggregate.time_until_oldest_ages_out(timedelta(hours=5), now)
+        assert remaining == timedelta(0)
+
+    def test_with_weekly_window(self):
+        """Test with a 7-day window duration."""
+        now = datetime(2025, 1, 20, 15, 0, 0, tzinfo=timezone.utc)
+        oldest = now - timedelta(days=5)  # 5 days ago
+
+        aggregate = UsageAggregate(
+            window_start=now - timedelta(days=7),
+            window_end=now,
+            input_tokens=1000,
+            output_tokens=500,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            message_count=1,
+            request_count=1,
+            oldest_record_timestamp=oldest,
+        )
+
+        # Oldest ages out at: 5 days ago + 7 days = 2 days from now
+        remaining = aggregate.time_until_oldest_ages_out(timedelta(days=7), now)
+        assert remaining == timedelta(days=2)

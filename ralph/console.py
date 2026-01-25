@@ -504,10 +504,12 @@ def print_usage_display(
     five_hour_pct = (five_hour_usage.rate_limited_tokens / five_hour_limit * 100) if five_hour_limit > 0 else 0
     weekly_pct = (weekly_usage.rate_limited_tokens / weekly_limit * 100) if weekly_limit > 0 else 0
 
-    # Time remaining calculations
+    # Time remaining calculations - when will oldest data age out?
     now = datetime.now(timezone.utc)
-    five_hour_time_remaining = _format_time_remaining(now + timedelta(hours=5), now)
-    weekly_time_remaining = _format_time_remaining(now + timedelta(days=7), now)
+    five_hour_remaining = five_hour_usage.time_until_oldest_ages_out(timedelta(hours=5), now)
+    weekly_remaining = weekly_usage.time_until_oldest_ages_out(timedelta(days=7), now)
+    five_hour_time_remaining = _format_time_remaining(now + five_hour_remaining, now)
+    weekly_time_remaining = _format_time_remaining(now + weekly_remaining, now)
 
     # 5-hour window progress bar (using rate_limited_tokens)
     five_hour_panel = _create_progress_bar(
@@ -979,3 +981,92 @@ def print_reeval_error(error: str) -> None:
         title="Re-Evaluation Warning",
         style="yellow",
     ))
+
+
+def print_reeval_proposed_changes(
+    approved_changes: list[Any],
+    rejected_changes: list[tuple[Any, str]],
+    summary: str,
+    dry_run: bool = False,
+) -> None:
+    """
+    Print proposed changes from re-evaluation for review.
+
+    Args:
+        approved_changes: List of approved ReEvalChange objects
+        rejected_changes: List of (change, reason) tuples for rejected changes
+        summary: Summary from the re-evaluation
+        dry_run: Whether this is a dry-run (no changes will be applied)
+    """
+    console.print()
+
+    if not approved_changes and not rejected_changes:
+        title = "Dry Run Complete" if dry_run else "Proposed Changes"
+        console.print(Panel(
+            "[bold green]No changes proposed[/bold green]\n\n"
+            f"[dim]{summary}[/dim]" if summary else "",
+            title=title,
+            style="green",
+        ))
+        return
+
+    # Build content
+    content_lines = []
+
+    if summary:
+        content_lines.append(f"[dim]{summary}[/dim]\n")
+
+    if approved_changes:
+        if dry_run:
+            content_lines.append("[bold cyan]Changes that would be applied:[/bold cyan]")
+        else:
+            content_lines.append("[bold cyan]Proposed Changes (pending approval):[/bold cyan]")
+        for change in approved_changes:
+            action = change.action.value if hasattr(change, 'action') else str(change)
+            story_id = change.story_id if hasattr(change, 'story_id') else ''
+            reason = change.reason if hasattr(change, 'reason') else ''
+            if action == "merge":
+                merge_into = change.merge_into if hasattr(change, 'merge_into') else ''
+                content_lines.append(f"  [cyan]>[/cyan] {action} {story_id} -> {merge_into}")
+            else:
+                content_lines.append(f"  [cyan]>[/cyan] {action} {story_id}")
+            if reason:
+                content_lines.append(f"    [dim]Reason: {reason}[/dim]")
+        content_lines.append("")
+
+    if rejected_changes:
+        content_lines.append("[bold yellow]Rejected by safeguards:[/bold yellow]")
+        for change, reason in rejected_changes:
+            action = change.action.value if hasattr(change, 'action') else str(change)
+            story_id = change.story_id if hasattr(change, 'story_id') else ''
+            content_lines.append(f"  [yellow]-[/yellow] {action} {story_id}: {reason}")
+
+    title = "Dry Run Complete" if dry_run else "Proposed Changes"
+    console.print(Panel(
+        "\n".join(content_lines),
+        title=title,
+        style="cyan",
+    ))
+
+
+def prompt_reeval_confirmation() -> bool:
+    """
+    Prompt user to confirm re-evaluation changes.
+
+    Returns:
+        True if user confirms, False otherwise.
+    """
+    console.print()
+    console.print("[bold]Apply these changes?[/bold] [dim](y/N)[/dim] ", end="")
+    try:
+        response = input().strip().lower()
+        return response in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return False
+
+
+def print_reeval_cancelled() -> None:
+    """Print a message when re-evaluation changes are cancelled."""
+    console.print()
+    console.print("[yellow]Re-evaluation changes cancelled by user[/yellow]")
