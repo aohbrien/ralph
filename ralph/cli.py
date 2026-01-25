@@ -735,6 +735,98 @@ def resume(
 
 
 @app.command()
+def story(
+    story_id: str = typer.Argument(..., help="Story ID to display (e.g., US-001)"),
+    prd: Path = typer.Option(
+        Path("prd.json"),
+        "--prd",
+        "-p",
+        help="Path to prd.json file",
+    ),
+) -> None:
+    """Display story details and current status."""
+    prd_path = prd.resolve()
+    if not prd_path.exists():
+        print_error(f"PRD file not found: {prd_path}")
+        raise typer.Exit(1)
+
+    try:
+        prd_obj = PRD.from_file(prd_path)
+    except Exception as e:
+        print_error(f"Failed to parse PRD: {e}")
+        raise typer.Exit(1)
+
+    story_obj = prd_obj.get_story_by_id(story_id)
+    if not story_obj:
+        print_error(f"Story not found: {story_id}")
+        available_ids = [s.id for s in prd_obj.user_stories]
+        console.print(f"[dim]Available stories: {', '.join(available_ids)}[/dim]")
+        raise typer.Exit(1)
+
+    # Display story details
+    status = "[green]PASS[/green]" if story_obj.passes else "[yellow]pending[/yellow]"
+    console.print()
+    console.print(f"[bold cyan]{story_obj.id}[/bold cyan]: {story_obj.title}")
+    console.print(f"Status: {status}")
+    console.print(f"Priority: {story_obj.priority}")
+    console.print()
+    console.print("[bold]Description:[/bold]")
+    console.print(f"  {story_obj.description}")
+    console.print()
+    console.print("[bold]Acceptance Criteria:[/bold]")
+    for criterion in story_obj.acceptance_criteria:
+        check = "[green]✓[/green]" if story_obj.passes else "[dim]○[/dim]"
+        console.print(f"  {check} {criterion}")
+    if story_obj.notes:
+        console.print()
+        console.print("[bold]Notes:[/bold]")
+        console.print(f"  {story_obj.notes}")
+
+
+@app.command(name="mark-complete")
+def mark_complete(
+    story_id: str = typer.Argument(..., help="Story ID to mark complete (e.g., US-001)"),
+    prd: Path = typer.Option(
+        Path("prd.json"),
+        "--prd",
+        "-p",
+        help="Path to prd.json file",
+    ),
+) -> None:
+    """Mark a story as complete (passes=true) in the PRD."""
+    prd_path = prd.resolve()
+    if not prd_path.exists():
+        print_error(f"PRD file not found: {prd_path}")
+        raise typer.Exit(1)
+
+    try:
+        prd_obj = PRD.from_file(prd_path)
+    except Exception as e:
+        print_error(f"Failed to parse PRD: {e}")
+        raise typer.Exit(1)
+
+    story_obj = prd_obj.get_story_by_id(story_id)
+    if not story_obj:
+        print_error(f"Story not found: {story_id}")
+        available_ids = [s.id for s in prd_obj.user_stories]
+        console.print(f"[dim]Available stories: {', '.join(available_ids)}[/dim]")
+        raise typer.Exit(1)
+
+    if story_obj.passes:
+        print_info(f"Story {story_id} is already marked as complete")
+        raise typer.Exit(0)
+
+    # Mark as complete and save
+    prd_obj.mark_story_complete(story_id)
+    prd_obj.save(prd_path)
+    print_success(f"Marked story {story_id} as complete")
+
+    # Show progress
+    completed, total = prd_obj.get_progress()
+    console.print(f"[dim]Progress: {completed}/{total} stories complete[/dim]")
+
+
+@app.command()
 def usage(
     set_plan: Optional[str] = typer.Option(
         None,

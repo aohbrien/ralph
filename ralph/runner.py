@@ -120,58 +120,54 @@ class Runner:
         else:
             return self.base_dir / "prompt.md"
 
-    def _generate_prompt(self, story: UserStory, prd: PRD) -> str:
+    def _generate_prompt(
+        self, story: UserStory, prd: PRD, iteration: int
+    ) -> str:
         """Generate a dynamic prompt for the current iteration."""
-        # Read the base prompt file (CLAUDE.md or prompt.md) for project context
-        base_context = ""
-        if self.prompt_path.exists():
-            base_context = self.prompt_path.read_text()
-
         # Format acceptance criteria as a checklist
         criteria_list = "\n".join(f"- [ ] {c}" for c in story.acceptance_criteria)
 
+        # Build notes section only if present
+        notes_section = f"\n**Notes:** {story.notes}" if story.notes else ""
+
         prompt = f"""# Task: Implement User Story {story.id}
 
-## Project Context
-{base_context}
+## Current Context
+- **Iteration:** {iteration} of {self.max_iterations}
+- **PRD Path:** {self.prd_path}
+- **Project:** {prd.project}
 
----
-
-## Your Assignment
-
-You are working on the **{prd.project}** project. Your task is to implement the following user story:
-
-### {story.id}: {story.title}
-
+## Story Details
+**ID:** {story.id}
+**Title:** {story.title}
 **Description:** {story.description}
 
 **Acceptance Criteria:**
 {criteria_list}
+{notes_section}
 
-{f"**Notes:** {story.notes}" if story.notes else ""}
+## Available CLI Tools
+
+Ralph provides these commands to manage PRD state:
+
+- `ralph story {story.id} --prd {self.prd_path}` - View this story's details and current status
+- `ralph mark-complete {story.id} --prd {self.prd_path}` - Mark this story as complete
+- `ralph status --prd {self.prd_path}` - View overall PRD progress
 
 ## Instructions
 
-1. **Analyze** the codebase to understand the current implementation
-2. **Implement** the changes needed to satisfy ALL acceptance criteria
-3. **Test** your changes to ensure they work correctly
-4. **Update** the prd.json file to set `"passes": true` for story {story.id} once all criteria are met
-5. **Update** progress.txt with a summary of what you did
+1. Read CLAUDE.md for project context if needed
+2. Implement the changes required to satisfy ALL acceptance criteria
+3. Test your changes to ensure they work correctly
+4. Run `ralph mark-complete {story.id} --prd {self.prd_path}` when all criteria are met
+5. Update progress.txt with a summary of what you did
+6. Output <promise>COMPLETE</promise> to signal completion
 
 ## Important
 
 - Focus ONLY on this story - do not implement other stories
 - Make sure ALL acceptance criteria are satisfied before marking complete
-- Run `mypy ralph` to ensure type checking passes if the criteria mention it
-- Run `pytest` if tests are part of the acceptance criteria
-
-## Completion Signal
-
-When you have successfully implemented this story AND updated prd.json to mark it as passing, output:
-
-<promise>COMPLETE</promise>
-
-This signals to Ralph that the story is done and it should move to the next iteration.
+- Run appropriate checks (mypy, pytest, flutter analyze) if mentioned in acceptance criteria
 """
         return prompt
 
@@ -517,7 +513,7 @@ This signals to Ralph that the story is done and it should move to the next iter
             return ProcessResult(output="", return_code=0, completed=True), None
 
         # Generate the dynamic prompt for this story
-        prompt = self._generate_prompt(next_story, prd)
+        prompt = self._generate_prompt(next_story, prd, iteration)
 
         if self.verbose:
             print_info(f"Running {self.tool.value} for story: {next_story.id}")
@@ -748,6 +744,18 @@ This signals to Ralph that the story is done and it should move to the next iter
 
             # Note: result.completed means the story signaled completion with <promise>COMPLETE</promise>
             # This just means this story is done - we still need to check if ALL stories are done
+
+            # Auto-mark story complete when signal detected
+            # This ensures the PRD stays in sync even if Claude forgot to run mark-complete
+            if result.completed and story_id:
+                prd = self._load_prd()
+                story_obj = prd.get_story_by_id(story_id)
+                if story_obj and not story_obj.passes:
+                    logger.debug(f"Auto-marking {story_id} as complete")
+                    prd.mark_story_complete(story_id)
+                    prd.save(self.prd_path)
+                    if self.verbose:
+                        print_info(f"Auto-marked story {story_id} as complete")
 
             # Reload PRD to check if all stories are done
             prd = self._load_prd()
