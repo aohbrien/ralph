@@ -23,6 +23,7 @@ class RunState:
     started_at: str
     updated_at: str
     story_count: int | None = None
+    last_reeval_iteration: int | None = None
 
     @classmethod
     def create(
@@ -56,6 +57,7 @@ class RunState:
             started_at=data["started_at"],
             updated_at=data["updated_at"],
             story_count=data.get("story_count"),
+            last_reeval_iteration=data.get("last_reeval_iteration"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -68,12 +70,18 @@ class RunState:
             "started_at": self.started_at,
             "updated_at": self.updated_at,
             "story_count": self.story_count,
+            "last_reeval_iteration": self.last_reeval_iteration,
         }
 
     def update(self, iteration: int, story_id: str | None) -> None:
         """Update the state with new iteration info."""
         self.last_iteration = iteration
         self.last_story_id = story_id
+        self.updated_at = datetime.now().isoformat()
+
+    def update_reeval(self, iteration: int) -> None:
+        """Update the state with the last re-evaluation iteration."""
+        self.last_reeval_iteration = iteration
         self.updated_at = datetime.now().isoformat()
 
 

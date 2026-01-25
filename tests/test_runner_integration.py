@@ -1139,7 +1139,7 @@ class TestPromptGeneration:
         story = prd.get_next_story()
         assert story is not None
 
-        prompt = runner._generate_prompt(story, prd)
+        prompt = runner._generate_prompt(story, prd, iteration=1)
 
         assert story.id in prompt
         assert story.title in prompt
@@ -1148,19 +1148,25 @@ class TestPromptGeneration:
             assert criterion in prompt
         assert "<promise>COMPLETE</promise>" in prompt
 
-    def test_generate_prompt_includes_base_context(self, temp_project_dir: Path):
-        """Test that generated prompt includes CLAUDE.md content."""
+    def test_generate_prompt_includes_context_info(self, temp_project_dir: Path):
+        """Test that generated prompt includes iteration and project context."""
         prd_path = temp_project_dir / "prd.json"
         prd = create_test_prd(prd_path)
 
-        runner = Runner(prd_path=prd_path, tool=Tool.CLAUDE)
+        runner = Runner(prd_path=prd_path, tool=Tool.CLAUDE, max_iterations=5)
 
         story = prd.get_next_story()
         assert story is not None
 
-        prompt = runner._generate_prompt(story, prd)
+        prompt = runner._generate_prompt(story, prd, iteration=3)
 
-        assert "Test Project" in prompt  # From CLAUDE.md
+        # Check iteration info is present
+        assert "Iteration:** 3 of 5" in prompt
+        # Check project name is present
+        assert prd.project in prompt
+        # Check CLI tools are documented
+        assert "ralph mark-complete" in prompt
+        assert "ralph story" in prompt
 
 
 # =============================================================================

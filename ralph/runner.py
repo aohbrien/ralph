@@ -24,6 +24,10 @@ from ralph.console import (
     print_max_iterations_reached,
     print_pacing_adjustment,
     print_prd_status,
+    print_reeval_changes,
+    print_reeval_error,
+    print_reeval_header,
+    print_reeval_skipped,
     print_resume_info,
     print_retry,
     print_retry_exhausted,
@@ -46,6 +50,8 @@ DEFAULT_ITERATION_DELAY = 2.0  # seconds
 DEFAULT_TIMEOUT = 30 * 60  # 30 minutes in seconds
 DEFAULT_MAX_RETRIES = 2  # per-iteration retry attempts
 RETRY_BACKOFF_BASE = 5.0  # seconds for first retry (5s, 15s, 45s with multiplier 3)
+DEFAULT_REEVAL_INTERVAL = 10  # Run re-evaluation every N iterations
+REEVAL_TIMEOUT = 5 * 60  # 5 minutes for re-evaluation
 
 # Adaptive pacing thresholds and multipliers
 DEFAULT_PACING_THRESHOLD_1 = 70.0  # 70% usage - 2x delay
@@ -76,6 +82,8 @@ class Runner:
         pacing_threshold_2: float = DEFAULT_PACING_THRESHOLD_2,
         pacing_threshold_3: float = DEFAULT_PACING_THRESHOLD_3,
         five_hour_limit: int | None = None,
+        reeval_interval: int = DEFAULT_REEVAL_INTERVAL,
+        no_reeval: bool = False,
     ):
         self.prd_path = prd_path
         self.tool = tool
@@ -94,6 +102,10 @@ class Runner:
         self.pacing_threshold_2 = pacing_threshold_2
         self.pacing_threshold_3 = pacing_threshold_3
         self.five_hour_limit = five_hour_limit
+
+        # Re-evaluation configuration
+        self.reeval_interval = reeval_interval
+        self.no_reeval = no_reeval
 
         # Track last pacing multiplier to only log changes
         self._last_pacing_multiplier: float = 1.0
@@ -120,58 +132,54 @@ class Runner:
         else:
             return self.base_dir / "prompt.md"
 
-    def _generate_prompt(self, story: UserStory, prd: PRD) -> str:
+    def _generate_prompt(
+        self, story: UserStory, prd: PRD, iteration: int
+    ) -> str:
         """Generate a dynamic prompt for the current iteration."""
-        # Read the base prompt file (CLAUDE.md or prompt.md) for project context
-        base_context = ""
-        if self.prompt_path.exists():
-            base_context = self.prompt_path.read_text()
-
         # Format acceptance criteria as a checklist
         criteria_list = "\n".join(f"- [ ] {c}" for c in story.acceptance_criteria)
 
+        # Build notes section only if present
+        notes_section = f"\n**Notes:** {story.notes}" if story.notes else ""
+
         prompt = f"""# Task: Implement User Story {story.id}
 
-## Project Context
-{base_context}
+## Current Context
+- **Iteration:** {iteration} of {self.max_iterations}
+- **PRD Path:** {self.prd_path}
+- **Project:** {prd.project}
 
----
-
-## Your Assignment
-
-You are working on the **{prd.project}** project. Your task is to implement the following user story:
-
-### {story.id}: {story.title}
-
+## Story Details
+**ID:** {story.id}
+**Title:** {story.title}
 **Description:** {story.description}
 
 **Acceptance Criteria:**
 {criteria_list}
+{notes_section}
 
-{f"**Notes:** {story.notes}" if story.notes else ""}
+## Available CLI Tools
+
+Ralph provides these commands to manage PRD state:
+
+- `ralph story {story.id} --prd {self.prd_path}` - View this story's details and current status
+- `ralph mark-complete {story.id} --prd {self.prd_path}` - Mark this story as complete
+- `ralph status --prd {self.prd_path}` - View overall PRD progress
 
 ## Instructions
 
-1. **Analyze** the codebase to understand the current implementation
-2. **Implement** the changes needed to satisfy ALL acceptance criteria
-3. **Test** your changes to ensure they work correctly
-4. **Update** the prd.json file to set `"passes": true` for story {story.id} once all criteria are met
-5. **Update** progress.txt with a summary of what you did
+1. Read CLAUDE.md for project context if needed
+2. Implement the changes required to satisfy ALL acceptance criteria
+3. Test your changes to ensure they work correctly
+4. Run `ralph mark-complete {story.id} --prd {self.prd_path}` when all criteria are met
+5. Update progress.txt with a summary of what you did
+6. Output <promise>COMPLETE</promise> to signal completion
 
 ## Important
 
 - Focus ONLY on this story - do not implement other stories
 - Make sure ALL acceptance criteria are satisfied before marking complete
-- Run `mypy ralph` to ensure type checking passes if the criteria mention it
-- Run `pytest` if tests are part of the acceptance criteria
-
-## Completion Signal
-
-When you have successfully implemented this story AND updated prd.json to mark it as passing, output:
-
-<promise>COMPLETE</promise>
-
-This signals to Ralph that the story is done and it should move to the next iteration.
+- Run appropriate checks (mypy, pytest, flutter analyze) if mentioned in acceptance criteria
 """
         return prompt
 
@@ -314,6 +322,164 @@ This signals to Ralph that the story is done and it should move to the next iter
         tasks = get_all_tasks_for_project(self.base_dir)
         if tasks:
             print_task_list(tasks, "Current Claude Tasks")
+
+    def _should_run_reeval(self, iteration: int) -> bool:
+        """
+        Check if re-evaluation should run at this iteration.
+
+        Re-evaluation runs every N iterations (reeval_interval), starting from
+        the interval number (e.g., 10, 20, 30 for interval=10).
+
+        Args:
+            iteration: Current iteration number
+
+        Returns:
+            True if re-evaluation should run
+        """
+        # Skip if disabled
+        if self.no_reeval or self.reeval_interval <= 0:
+            return False
+
+        # Check if this is a reeval iteration
+        if iteration % self.reeval_interval != 0:
+            return False
+
+        # Check if we already ran reeval at this iteration (for resume)
+        if self._run_state and self._run_state.last_reeval_iteration == iteration:
+            return False
+
+        return True
+
+    def _run_reeval_iteration(self, iteration: int) -> bool:
+        """
+        Run a re-evaluation iteration.
+
+        This is a "pseudo iteration" that analyzes the PRD for issues and
+        may modify pending stories. It does NOT count against max_iterations.
+
+        Args:
+            iteration: Current iteration number (for logging)
+
+        Returns:
+            True if re-evaluation completed successfully
+        """
+        from ralph.reeval import (
+            REEVAL_COMPLETE_SIGNAL,
+            apply_changes,
+            append_reeval_to_progress,
+            generate_reeval_prompt,
+            parse_reeval_response,
+            validate_changes,
+        )
+
+        print_reeval_header(iteration)
+
+        # Load current PRD
+        prd = self._load_prd()
+
+        # Check if there are any pending stories to evaluate
+        pending_count = sum(1 for s in prd.user_stories if not s.passes)
+        if pending_count == 0:
+            print_reeval_skipped("All stories are complete")
+            return True
+
+        # Skip if only 1 pending story (nothing to merge/remove safely)
+        if pending_count == 1:
+            print_reeval_skipped("Only 1 pending story remaining")
+            return True
+
+        # Generate the re-evaluation prompt with iteration context
+        progress_path = self._get_progress_path()
+        prompt = generate_reeval_prompt(
+            prd,
+            progress_path,
+            current_iteration=iteration,
+            max_iterations=self.max_iterations,
+        )
+
+        if self.verbose:
+            print_info("Running PRD re-evaluation...")
+
+        # Run the tool with a shorter timeout
+        self._managed_process.reset()
+        output_handler = self._create_output_handler()
+
+        try:
+            result = run_tool_with_prompt(
+                tool=self.tool,
+                prompt=prompt,
+                on_output=output_handler,
+                cwd=self.base_dir,
+                managed_process=self._managed_process,
+                timeout=REEVAL_TIMEOUT,
+            )
+        except Exception as e:
+            print_reeval_error(f"Failed to run re-evaluation: {e}")
+            return False
+
+        console.print()  # Newline after output
+
+        # Check for interruption
+        if result.interrupted or self._interrupted:
+            logger.info("Re-evaluation interrupted")
+            return False
+
+        # Check for timeout
+        if result.timed_out:
+            print_reeval_error("Re-evaluation timed out")
+            return False
+
+        # Parse the response
+        reeval_result = parse_reeval_response(result.output)
+
+        if reeval_result.error:
+            print_reeval_error(reeval_result.error)
+            return False
+
+        # Validate proposed changes
+        validation = validate_changes(prd, reeval_result.changes)
+
+        # Apply approved changes
+        applied_changes: list[str] = []
+        if validation.approved_changes:
+            # Create a backup of the PRD before modifying
+            backup_path = self.prd_path.with_suffix(".json.bak")
+            try:
+                import shutil
+                shutil.copy2(self.prd_path, backup_path)
+                if self.verbose:
+                    print_info(f"Created PRD backup: {backup_path}")
+            except Exception as e:
+                logger.warning(f"Failed to create PRD backup: {e}")
+
+            prd, applied_changes = apply_changes(prd, validation.approved_changes)
+            # Save the modified PRD
+            prd.save(self.prd_path)
+
+        # Log to progress.txt
+        append_reeval_to_progress(
+            progress_path,
+            reeval_result,
+            validation,
+            applied_changes,
+        )
+
+        # Print results
+        print_reeval_changes(
+            applied_changes,
+            validation.rejected_changes,
+            reeval_result.summary,
+        )
+
+        # Update state
+        if self._run_state:
+            self._run_state.update_reeval(iteration)
+            save_state(self.base_dir, self._run_state)
+
+        # Save iteration log
+        self._save_iteration_log(iteration, "reeval", result.output)
+
+        return True
 
     def _calculate_backoff(self, attempt: int) -> float:
         """Calculate exponential backoff delay for retry attempt.
@@ -517,7 +683,7 @@ This signals to Ralph that the story is done and it should move to the next iter
             return ProcessResult(output="", return_code=0, completed=True), None
 
         # Generate the dynamic prompt for this story
-        prompt = self._generate_prompt(next_story, prd)
+        prompt = self._generate_prompt(next_story, prd, iteration)
 
         if self.verbose:
             print_info(f"Running {self.tool.value} for story: {next_story.id}")
@@ -707,6 +873,16 @@ This signals to Ralph that the story is done and it should move to the next iter
                 print_interrupt(iteration, completed, total)
                 return 130  # Standard exit code for SIGINT
 
+            # Re-evaluation check BEFORE story iteration
+            if self._should_run_reeval(iteration):
+                self._run_reeval_iteration(iteration)
+                # Check for interrupt after re-eval
+                if self._interrupted:
+                    prd = self._load_prd()
+                    completed, total = prd.get_progress()
+                    print_interrupt(iteration, completed, total)
+                    return 130
+
             # Run iteration with retry logic
             result, story_id = self._run_iteration_with_retry(iteration)
 
@@ -749,6 +925,18 @@ This signals to Ralph that the story is done and it should move to the next iter
             # Note: result.completed means the story signaled completion with <promise>COMPLETE</promise>
             # This just means this story is done - we still need to check if ALL stories are done
 
+            # Auto-mark story complete when signal detected
+            # This ensures the PRD stays in sync even if Claude forgot to run mark-complete
+            if result.completed and story_id:
+                prd = self._load_prd()
+                story_obj = prd.get_story_by_id(story_id)
+                if story_obj and not story_obj.passes:
+                    logger.debug(f"Auto-marking {story_id} as complete")
+                    prd.mark_story_complete(story_id)
+                    prd.save(self.prd_path)
+                    if self.verbose:
+                        print_info(f"Auto-marked story {story_id} as complete")
+
             # Reload PRD to check if all stories are done
             prd = self._load_prd()
             if prd.is_complete():
@@ -789,6 +977,8 @@ def run_ralph(
     pacing_threshold_2: float = DEFAULT_PACING_THRESHOLD_2,
     pacing_threshold_3: float = DEFAULT_PACING_THRESHOLD_3,
     five_hour_limit: int | None = None,
+    reeval_interval: int = DEFAULT_REEVAL_INTERVAL,
+    no_reeval: bool = False,
 ) -> bool | int:
     """
     Convenience function to run Ralph.
@@ -808,6 +998,8 @@ def run_ralph(
         pacing_threshold_2: Usage % for 4x delay (default: 80)
         pacing_threshold_3: Usage % for 8x delay (default: 90)
         five_hour_limit: Override 5-hour token limit (None = use plan limit)
+        reeval_interval: Run PRD re-evaluation every N iterations (0 to disable)
+        no_reeval: Disable PRD re-evaluation entirely
 
     Returns:
         True if all stories were completed
@@ -830,5 +1022,7 @@ def run_ralph(
         pacing_threshold_2=pacing_threshold_2,
         pacing_threshold_3=pacing_threshold_3,
         five_hour_limit=five_hour_limit,
+        reeval_interval=reeval_interval,
+        no_reeval=no_reeval,
     )
     return runner.run()
