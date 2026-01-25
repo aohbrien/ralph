@@ -178,9 +178,9 @@ def run(
         help="Disable PRD re-evaluation entirely",
     ),
     reeval_confirm: bool = typer.Option(
-        True,
+        False,
         "--reeval-confirm/--no-reeval-confirm",
-        help="Require user confirmation before applying re-evaluation changes",
+        help="Require user confirmation before applying re-evaluation changes (default: auto-accept)",
     ),
     reeval_dry_run: bool = typer.Option(
         False,
@@ -686,9 +686,9 @@ def resume(
         help="Disable PRD re-evaluation entirely",
     ),
     reeval_confirm: bool = typer.Option(
-        True,
+        False,
         "--reeval-confirm/--no-reeval-confirm",
-        help="Require user confirmation before applying re-evaluation changes",
+        help="Require user confirmation before applying re-evaluation changes (default: auto-accept)",
     ),
     reeval_dry_run: bool = typer.Option(
         False,

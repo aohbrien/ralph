@@ -1236,14 +1236,14 @@ class TestRunnerConfirmAndDryRun:
 
             assert runner.reeval_dry_run is True
 
-    def test_runner_default_confirm_is_true(self):
-        """Test that reeval_confirm defaults to True."""
+    def test_runner_default_confirm_is_false(self):
+        """Test that reeval_confirm defaults to False (auto-accept)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             prd_path = self.create_test_prd_file(tmpdir)
 
             runner = Runner(prd_path=prd_path)
 
-            assert runner.reeval_confirm is True
+            assert runner.reeval_confirm is False
 
     def test_runner_default_dry_run_is_false(self):
         """Test that reeval_dry_run defaults to False."""

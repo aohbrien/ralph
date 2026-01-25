@@ -87,7 +87,7 @@ class Runner:
         five_hour_limit: int | None = None,
         reeval_interval: int = DEFAULT_REEVAL_INTERVAL,
         no_reeval: bool = False,
-        reeval_confirm: bool = True,
+        reeval_confirm: bool = False,
         reeval_dry_run: bool = False,
     ):
         self.prd_path = prd_path
