@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
-import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
+
+logger = logging.getLogger("ralph.conversation")
 
 
 def get_claude_project_dir(working_dir: Path) -> Path | None:
@@ -16,15 +18,16 @@ def get_claude_project_dir(working_dir: Path) -> Path | None:
     Get the Claude project directory for a given working directory.
 
     Claude stores conversations in ~/.claude/projects/<encoded-path>/
-    where encoded-path is the absolute path with / replaced by -
+    where encoded-path is the absolute path with / and _ replaced by -
     """
     claude_base = Path.home() / ".claude" / "projects"
     if not claude_base.exists():
         return None
 
-    # Encode the path: /Users/foo/bar -> -Users-foo-bar
+    # Encode the path: /Users/foo/bar_baz -> -Users-foo-bar-baz
+    # Claude replaces both / and _ with -
     abs_path = working_dir.resolve()
-    encoded = str(abs_path).replace("/", "-")
+    encoded = str(abs_path).replace("/", "-").replace("_", "-")
 
     project_dir = claude_base / encoded
     if project_dir.exists():
@@ -77,9 +80,16 @@ def format_tool_use(content: dict[str, Any]) -> str:
         return f"  → {name}"
 
 
-def format_message(entry: dict[str, Any], output: TextIO = sys.stderr) -> None:
-    """Format and print a conversation entry."""
+def format_message(entry: dict[str, Any]) -> None:
+    """Format and print a conversation entry.
+
+    Uses os.write(2, ...) directly to bypass Rich/Typer stderr interception.
+    """
     msg_type = entry.get("type")
+
+    def write_line(text: str) -> None:
+        """Write directly to fd 2 (stderr) bypassing Python buffering."""
+        os.write(2, (text + "\n").encode())
 
     if msg_type == "user":
         message = entry.get("message", {})
@@ -88,7 +98,7 @@ def format_message(entry: dict[str, Any], output: TextIO = sys.stderr) -> None:
             # Truncate very long user messages (like CLAUDE.md prompts)
             if len(content) > 200:
                 content = content[:197] + "..."
-            print(f"\n\033[36m▶ User:\033[0m {content}", file=output)
+            write_line(f"\n\033[36m▶ User:\033[0m {content}")
 
     elif msg_type == "assistant":
         message = entry.get("message", {})
@@ -101,17 +111,16 @@ def format_message(entry: dict[str, Any], output: TextIO = sys.stderr) -> None:
                     if block_type == "text":
                         text = block.get("text", "")
                         if text:
-                            print(f"\n\033[32m◀ Claude:\033[0m {text}", file=output)
+                            write_line(f"\n\033[32m◀ Claude:\033[0m {text}")
                     elif block_type == "tool_use":
-                        print(f"\033[33m{format_tool_use(block)}\033[0m", file=output)
+                        write_line(f"\033[33m{format_tool_use(block)}\033[0m")
 
 
 class ConversationWatcher:
     """Watch a Claude conversation file and display messages in real-time."""
 
-    def __init__(self, working_dir: Path, output: TextIO = sys.stderr):
+    def __init__(self, working_dir: Path):
         self.working_dir = working_dir
-        self.output = output
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._seen_uuids: set[str] = set()
@@ -142,16 +151,20 @@ class ConversationWatcher:
                 return
             self._seen_uuids.add(uuid)
 
-        # Format and display
-        format_message(entry, self.output)
-        self.output.flush()
+        msg_type = entry.get("type")
+        logger.debug(f"Processing message: type={msg_type}, uuid={uuid[:8] if uuid else 'none'}...")
+
+        # Format and display (writes directly to fd 2)
+        format_message(entry)
 
     def _watch_loop(self) -> None:
         """Main watch loop - runs in a thread."""
         project_dir = get_claude_project_dir(self.working_dir)
         if not project_dir:
+            logger.debug("No Claude project directory found")
             return
 
+        logger.debug(f"Watching project dir: {project_dir}")
         current_file: Path | None = None
         file_pos = 0
 
@@ -160,45 +173,58 @@ class ConversationWatcher:
             latest = get_latest_conversation(project_dir)
 
             if latest and latest != current_file:
-                # New conversation started
+                # Conversation file changed or first time seeing it
                 if self._initial_file and latest != self._initial_file:
-                    # This is a genuinely new file (not the one that existed before we started)
+                    # This is a genuinely new file - read from the start
+                    logger.debug(f"New conversation file detected: {latest.name}")
                     current_file = latest
                     file_pos = 0
                     self._seen_uuids.clear()
-                elif not self._initial_file:
-                    # First time finding a file
-                    self._initial_file = latest
-                    current_file = latest
+                else:
+                    # Either no initial file, or Claude is using the same file
                     # Start from current position (don't replay old messages)
+                    logger.debug(f"Using conversation file: {latest.name}, starting at pos {latest.stat().st_size}")
+                    current_file = latest
                     file_pos = current_file.stat().st_size
 
             if current_file and current_file.exists():
                 try:
+                    current_size = current_file.stat().st_size
+                    if current_size > file_pos:
+                        logger.debug(f"New data in conversation: {current_size - file_pos} bytes")
                     with open(current_file, "r") as f:
                         f.seek(file_pos)
                         for line in f:
                             self._process_line(line)
                         file_pos = f.tell()
-                except (OSError, IOError):
-                    pass
+                except (OSError, IOError) as e:
+                    logger.debug(f"Error reading conversation file: {e}")
 
             # Small sleep to avoid busy-waiting
             self._stop_event.wait(0.1)
 
     def start(self) -> None:
         """Start watching in a background thread."""
+        logger.debug(f"ConversationWatcher.start() called for {self.working_dir}")
+
         if self._thread is not None:
+            logger.debug("Watcher thread already running")
             return
 
         # Record what file exists before we start (so we can detect new ones)
         project_dir = get_claude_project_dir(self.working_dir)
+        logger.debug(f"Claude project dir: {project_dir}")
+
         if project_dir:
             self._initial_file = get_latest_conversation(project_dir)
+            logger.debug(f"Initial conversation file: {self._initial_file}")
+        else:
+            logger.debug("No Claude project dir found - watcher may not work")
 
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._watch_loop, daemon=True)
         self._thread.start()
+        logger.debug("Watcher thread started")
 
     def stop(self) -> None:
         """Stop watching."""
