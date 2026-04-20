@@ -67,7 +67,7 @@ mypy ralph
 
 **Process Execution**: `ralph/process.py`
 - Uses PTY for unbuffered real-time streaming output
-- `run_tool()` pipes prompt file to `claude --dangerously-skip-permissions --print`, `amp --dangerously-allow-all`, `opencode -p <prompt> -q`, or `ccs -p <prompt>`
+- `run_tool()` pipes prompt file to `claude --dangerously-skip-permissions --print`, `amp --dangerously-allow-all`, `opencode -p <prompt> -q`, or `ccs [profile] --dangerously-skip-permissions --print <prompt>`
 - `ManagedProcess` allows external termination (for signal handlers)
 - Supports four tools: `claude`, `amp`, `opencode`, `ccs`
 
@@ -173,10 +173,10 @@ npm install -g @kaitranntt/ccs
 ccs config
 ```
 
-Ralph invokes it as `ccs [profile] [passthrough args...] -p <prompt>`:
+Ralph invokes it as `ccs [profile] [passthrough args...] <prompt>`:
 
-- `--ccs-profile <name>` — ccs profile/runtime name (e.g. `personal2`). Passed as the first positional arg.
-- `--ccs-args "<flags>"` — extra args forwarded through ccs to the underlying CLI. Defaults to `--dangerously-skip-permissions` (matches how Ralph invokes `claude` directly). Pass `--ccs-args ""` to suppress the default.
+- `--ccs-profile <name>` — ccs profile/account name (e.g. `personal2`). Passed as the first positional arg.
+- `--ccs-args "<flags>"` — extra args forwarded through ccs to the underlying CLI. Defaults to `--dangerously-skip-permissions --print` — claude's own headless mode. We deliberately avoid ccs's `-p` delegation flag because it requires a separately configured delegation profile; account instances (`ccs auth create <name>`) only work with claude's `--print`. Pass `--ccs-args ""` to suppress the default.
 
 Example matching the typical `ccs personal2 --dangerously-skip-permissions` invocation:
 

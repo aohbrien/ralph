@@ -226,9 +226,9 @@ def run(
         None,
         "--ccs-args",
         help=(
-            "Extra args passed through ccs to the underlying CLI "
-            "(e.g. '--dangerously-skip-permissions'). Defaults to "
-            "'--dangerously-skip-permissions'; pass '' to opt out. "
+            "Extra args passed through ccs to the underlying CLI. "
+            "Defaults to '--dangerously-skip-permissions --print' "
+            "(claude headless mode); pass '' to opt out. "
             "Only used when tool is ccs."
         ),
     ),
@@ -796,9 +796,9 @@ def resume(
         None,
         "--ccs-args",
         help=(
-            "Extra args passed through ccs to the underlying CLI "
-            "(e.g. '--dangerously-skip-permissions'). Defaults to "
-            "'--dangerously-skip-permissions'; pass '' to opt out. "
+            "Extra args passed through ccs to the underlying CLI. "
+            "Defaults to '--dangerously-skip-permissions --print' "
+            "(claude headless mode); pass '' to opt out. "
             "Only used when tool is ccs."
         ),
     ),

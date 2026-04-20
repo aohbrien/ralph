@@ -400,9 +400,14 @@ def run_tool(
     )
 
 
-# Default extra args appended to ccs invocations. Mirrors Tool.CLAUDE's hardcoded
-# --dangerously-skip-permissions (ccs forwards unknown flags to the underlying CLI).
-DEFAULT_CCS_ARGS = "--dangerously-skip-permissions"
+# Default extra args appended to ccs invocations. `--dangerously-skip-permissions`
+# mirrors Tool.CLAUDE's hardcoded flag; `--print` is claude's own headless mode.
+# We deliberately use claude's --print (positional prompt) rather than ccs's
+# -p/--prompt delegation mode, which requires a separately configured delegation
+# profile. Account instances created via `ccs auth create` work with --print but
+# NOT with -p. Because ccs forwards unknown flags to the underlying CLI, this
+# works uniformly for account profiles, OAuth providers, and other runtimes.
+DEFAULT_CCS_ARGS = "--dangerously-skip-permissions --print"
 
 
 def run_tool_with_prompt(
@@ -444,16 +449,18 @@ def run_tool_with_prompt(
         cmd = ["opencode", "-p", prompt, "-q"]
         input_text = None  # Don't use stdin
     elif tool == Tool.CCS:
-        # ccs syntax: `ccs [profile] [passthrough args...] -p <prompt>`.
+        # ccs syntax: `ccs [profile] [passthrough args...] [prompt]`.
         # Profile selects the account/runtime; passthrough args are forwarded to
-        # the underlying CLI (e.g. --dangerously-skip-permissions for claude).
+        # the underlying CLI. The prompt is passed as a positional arg to claude's
+        # --print (included in DEFAULT_CCS_ARGS); we avoid ccs's own -p flag
+        # because it requires a delegation profile that account instances don't have.
         extras_raw = DEFAULT_CCS_ARGS if ccs_args is None else ccs_args
         cmd = ["ccs"]
         if ccs_profile:
             cmd.append(ccs_profile)
         if extras_raw:
             cmd.extend(shlex.split(extras_raw))
-        cmd.extend(["-p", prompt])
+        cmd.append(prompt)
         input_text = None  # Don't use stdin
     else:
         raise ValueError(f"Unknown tool: {tool}")

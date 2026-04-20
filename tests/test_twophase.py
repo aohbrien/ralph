@@ -375,24 +375,29 @@ class TestToolEnum:
         assert "opencode" in tools
         assert "ccs" in tools
 
-    def test_ccs_dispatch_defaults_include_dangerously_skip_permissions(self):
-        """By default ccs invocations pass --dangerously-skip-permissions through."""
+    def test_ccs_dispatch_defaults_include_dangerously_skip_permissions_and_print(self):
+        """By default ccs invocations pass --dangerously-skip-permissions --print through."""
         with patch("ralph.process.stream_process") as mock_stream:
             run_tool_with_prompt(Tool.CCS, "hello world")
 
         assert mock_stream.call_count == 1
         kwargs = mock_stream.call_args.kwargs
-        assert kwargs["cmd"] == ["ccs", "--dangerously-skip-permissions", "-p", "hello world"]
+        assert kwargs["cmd"] == [
+            "ccs",
+            "--dangerously-skip-permissions",
+            "--print",
+            "hello world",
+        ]
         assert kwargs["input_text"] is None
 
     def test_ccs_dispatch_with_profile_and_extra_args(self):
-        """ccs_profile is positional; ccs_args is shlex-split before -p."""
+        """ccs_profile is positional; ccs_args is shlex-split; prompt trails."""
         with patch("ralph.process.stream_process") as mock_stream:
             run_tool_with_prompt(
                 Tool.CCS,
                 "hi",
                 ccs_profile="personal2",
-                ccs_args="--dangerously-skip-permissions --foo bar",
+                ccs_args="--dangerously-skip-permissions --print --foo bar",
             )
 
         kwargs = mock_stream.call_args.kwargs
@@ -400,19 +405,19 @@ class TestToolEnum:
             "ccs",
             "personal2",
             "--dangerously-skip-permissions",
+            "--print",
             "--foo",
             "bar",
-            "-p",
             "hi",
         ]
 
     def test_ccs_dispatch_empty_ccs_args_opts_out_of_defaults(self):
-        """Passing ccs_args='' suppresses the default --dangerously-skip-permissions."""
+        """Passing ccs_args='' suppresses the default passthrough flags."""
         with patch("ralph.process.stream_process") as mock_stream:
             run_tool_with_prompt(Tool.CCS, "hi", ccs_profile="personal2", ccs_args="")
 
         kwargs = mock_stream.call_args.kwargs
-        assert kwargs["cmd"] == ["ccs", "personal2", "-p", "hi"]
+        assert kwargs["cmd"] == ["ccs", "personal2", "hi"]
 
 
 # =============================================================================
