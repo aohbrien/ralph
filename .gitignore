@@ -220,3 +220,6 @@ prd.json
 
 .last-branch
 .ralph-state.json
+
+# Claude Code harness worktree metadata
+.claude/
