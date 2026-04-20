@@ -12,8 +12,14 @@ Ralph is an autonomous AI agent loop for PRD-driven development. It orchestrates
 # Install in development mode
 pip install -e ".[dev]"
 
-# Run the agent loop
+# Run the agent loop (single-phase: one tool does everything)
 ralph run --prd path/to/prd.json
+
+# Run with two-phase orchestration (Claude plans, OpenCode codes)
+ralph run --two-phase --prd path/to/prd.json
+
+# Two-phase with custom tools
+ralph run --two-phase --planning-tool claude --coding-tool amp
 
 # Check PRD progress
 ralph status --prd path/to/prd.json
@@ -26,6 +32,9 @@ ralph init --project "My Project"
 
 # Resume an interrupted run
 ralph resume --prd path/to/prd.json
+
+# Resume in two-phase mode
+ralph resume --two-phase --prd path/to/prd.json
 
 # Archive current run state
 ralph archive --prd path/to/prd.json
@@ -58,8 +67,16 @@ mypy ralph
 
 **Process Execution**: `ralph/process.py`
 - Uses PTY for unbuffered real-time streaming output
-- `run_tool()` pipes prompt file to `claude --dangerously-skip-permissions --print` or `amp --dangerously-allow-all`
+- `run_tool()` pipes prompt file to `claude --dangerously-skip-permissions --print`, `amp --dangerously-allow-all`, or `opencode -p <prompt> -q`
 - `ManagedProcess` allows external termination (for signal handlers)
+- Supports three tools: `claude`, `amp`, `opencode`
+
+**Two-Phase Orchestration**: `ralph/twophase.py`
+- Separates planning and coding into two phases
+- Phase 1 (Planning): Analyzes story and creates implementation plan
+- Phase 2 (Coding): Executes the plan step-by-step
+- Plan extraction via `<implementation-plan>` tags
+- Configurable tools and timeouts per phase
 
 **State Management**: `ralph/state.py`
 - Persists run state to `.ralph-state.json` for resume functionality
@@ -87,6 +104,63 @@ mypy ralph
       "notes": "Optional notes"
     }
   ]
+}
+```
+
+## Two-Phase Orchestration
+
+Two-phase mode separates planning from implementation, leveraging different AI models for each phase:
+
+```bash
+ralph run --two-phase --prd path/to/prd.json
+```
+
+### How It Works
+
+1. **Phase 1 (Planning)**: The planning tool (default: Claude) analyzes the story, explores the codebase, and outputs a detailed implementation plan within `<implementation-plan>` tags.
+
+2. **Phase 2 (Coding)**: The coding tool (default: OpenCode) receives the extracted plan and executes it step-by-step.
+
+### CLI Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--two-phase` | false | Enable two-phase orchestration |
+| `--planning-tool` | claude | Tool for planning: claude, amp, opencode |
+| `--coding-tool` | opencode | Tool for coding: claude, amp, opencode |
+| `--planning-timeout` | 10 min | Planning phase timeout |
+| `--coding-timeout` | 30 min | Coding phase timeout |
+
+### Plan Format
+
+The planning phase must output a plan in this format:
+
+```markdown
+<implementation-plan>
+## Summary
+Brief overview of the implementation approach.
+
+## Files to Modify
+- path/to/file.py - Description of changes
+
+## Step-by-Step Implementation
+1. **Step Title**: Detailed instructions
+2. **Step Title**: Detailed instructions
+
+## Verification Commands
+- pytest tests/
+- mypy ralph/
+</implementation-plan>
+```
+
+### OpenCode Configuration
+
+OpenCode uses Gemini 3 Pro by default. Configure via `.opencode.json`:
+
+```json
+{
+  "provider": "gemini",
+  "model": "gemini-3-pro"
 }
 ```
 

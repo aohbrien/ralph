@@ -1070,3 +1070,73 @@ def print_reeval_cancelled() -> None:
     """Print a message when re-evaluation changes are cancelled."""
     console.print()
     console.print("[yellow]Re-evaluation changes cancelled by user[/yellow]")
+
+
+def print_phase_header(phase: int, name: str, tool: Any) -> None:
+    """
+    Print header for a two-phase orchestration phase.
+
+    Args:
+        phase: Phase number (1 or 2)
+        name: Phase name (e.g., "Planning", "Coding")
+        tool: Tool being used for this phase
+    """
+    tool_name = tool.value if hasattr(tool, "value") else str(tool)
+    console.print()
+    console.print(Panel(
+        f"[bold]Phase {phase}: {name}[/bold]\n"
+        f"Tool: [cyan]{tool_name}[/cyan]",
+        style="cyan",
+    ))
+
+
+def print_plan_extraction_result(success: bool, error: str | None = None) -> None:
+    """
+    Print the result of plan extraction from planning phase output.
+
+    Args:
+        success: Whether a plan was successfully extracted
+        error: Error message if extraction failed
+    """
+    console.print()
+    if success:
+        console.print("[green]Plan extracted successfully[/green]")
+    else:
+        console.print(Panel(
+            f"[bold yellow]Failed to extract plan[/bold yellow]\n"
+            f"{error or 'No implementation plan found in output'}",
+            title="Plan Extraction Failed",
+            style="yellow",
+        ))
+
+
+def print_two_phase_summary(
+    planning_success: bool,
+    coding_success: bool,
+    story_id: str | None,
+) -> None:
+    """
+    Print summary of a two-phase iteration.
+
+    Args:
+        planning_success: Whether planning phase succeeded
+        coding_success: Whether coding phase succeeded
+        story_id: Story ID that was worked on
+    """
+    console.print()
+
+    planning_status = "[green]passed[/green]" if planning_success else "[red]failed[/red]"
+    coding_status = "[green]passed[/green]" if coding_success else "[red]failed[/red]"
+    overall = planning_success and coding_success
+
+    story_info = f"Story: [cyan]{story_id}[/cyan]" if story_id else ""
+
+    style = "green" if overall else "yellow"
+    console.print(Panel(
+        f"[bold]Two-Phase Iteration Summary[/bold]\n\n"
+        f"Planning: {planning_status}\n"
+        f"Coding: {coding_status}\n"
+        f"{story_info}",
+        title="Summary",
+        style=style,
+    ))

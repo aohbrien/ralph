@@ -192,6 +192,31 @@ def run(
         "--debug",
         help="Enable debug logging to specified file (e.g., --debug output.log)",
     ),
+    two_phase: bool = typer.Option(
+        False,
+        "--two-phase",
+        help="Enable two-phase orchestration (planning + coding)",
+    ),
+    planning_tool: str = typer.Option(
+        "claude",
+        "--planning-tool",
+        help="Tool for planning phase: claude, amp, or opencode",
+    ),
+    coding_tool: str = typer.Option(
+        "opencode",
+        "--coding-tool",
+        help="Tool for coding phase: claude, amp, or opencode",
+    ),
+    planning_timeout: int = typer.Option(
+        10,
+        "--planning-timeout",
+        help="Planning phase timeout in minutes (default: 10)",
+    ),
+    coding_timeout: int = typer.Option(
+        30,
+        "--coding-timeout",
+        help="Coding phase timeout in minutes (default: 30)",
+    ),
 ) -> None:
     """Run the Ralph autonomous agent loop."""
     import logging
@@ -219,8 +244,23 @@ def run(
     try:
         tool_enum = Tool(tool.lower())
     except ValueError:
-        print_error(f"Invalid tool: {tool}. Must be 'claude' or 'amp'")
+        print_error(f"Invalid tool: {tool}. Must be 'claude', 'amp', or 'opencode'")
         raise typer.Exit(1)
+
+    # Parse two-phase tools if enabled
+    planning_tool_enum = Tool.CLAUDE
+    coding_tool_enum = Tool.OPENCODE
+    if two_phase:
+        try:
+            planning_tool_enum = Tool(planning_tool.lower())
+        except ValueError:
+            print_error(f"Invalid planning tool: {planning_tool}. Must be 'claude', 'amp', or 'opencode'")
+            raise typer.Exit(1)
+        try:
+            coding_tool_enum = Tool(coding_tool.lower())
+        except ValueError:
+            print_error(f"Invalid coding tool: {coding_tool}. Must be 'claude', 'amp', or 'opencode'")
+            raise typer.Exit(1)
 
     # Load PRD
     logger.debug("Loading PRD file...")
@@ -338,6 +378,11 @@ def run(
         no_reeval=no_reeval,
         reeval_confirm=reeval_confirm,
         reeval_dry_run=reeval_dry_run,
+        two_phase=two_phase,
+        planning_tool=planning_tool_enum,
+        coding_tool=coding_tool_enum,
+        planning_timeout=planning_timeout * 60 if planning_timeout > 0 else None,
+        coding_timeout=coding_timeout * 60 if coding_timeout > 0 else None,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -700,6 +745,31 @@ def resume(
         "--debug",
         help="Enable debug logging to specified file (e.g., --debug output.log)",
     ),
+    two_phase: bool = typer.Option(
+        False,
+        "--two-phase",
+        help="Enable two-phase orchestration (planning + coding)",
+    ),
+    planning_tool: str = typer.Option(
+        "claude",
+        "--planning-tool",
+        help="Tool for planning phase: claude, amp, or opencode",
+    ),
+    coding_tool: str = typer.Option(
+        "opencode",
+        "--coding-tool",
+        help="Tool for coding phase: claude, amp, or opencode",
+    ),
+    planning_timeout: int = typer.Option(
+        10,
+        "--planning-timeout",
+        help="Planning phase timeout in minutes (default: 10)",
+    ),
+    coding_timeout: int = typer.Option(
+        30,
+        "--coding-timeout",
+        help="Coding phase timeout in minutes (default: 30)",
+    ),
 ) -> None:
     """Resume a previously interrupted run."""
     from ralph.logging_config import setup_logging
@@ -722,8 +792,23 @@ def resume(
     try:
         tool_enum = Tool(tool.lower())
     except ValueError:
-        print_error(f"Invalid tool: {tool}. Must be 'claude' or 'amp'")
+        print_error(f"Invalid tool: {tool}. Must be 'claude', 'amp', or 'opencode'")
         raise typer.Exit(1)
+
+    # Parse two-phase tools if enabled
+    planning_tool_enum = Tool.CLAUDE
+    coding_tool_enum = Tool.OPENCODE
+    if two_phase:
+        try:
+            planning_tool_enum = Tool(planning_tool.lower())
+        except ValueError:
+            print_error(f"Invalid planning tool: {planning_tool}. Must be 'claude', 'amp', or 'opencode'")
+            raise typer.Exit(1)
+        try:
+            coding_tool_enum = Tool(coding_tool.lower())
+        except ValueError:
+            print_error(f"Invalid coding tool: {coding_tool}. Must be 'claude', 'amp', or 'opencode'")
+            raise typer.Exit(1)
 
     # Parse limit mode
     try:
@@ -770,6 +855,11 @@ def resume(
         no_reeval=no_reeval,
         reeval_confirm=reeval_confirm,
         reeval_dry_run=reeval_dry_run,
+        two_phase=two_phase,
+        planning_tool=planning_tool_enum,
+        coding_tool=coding_tool_enum,
+        planning_timeout=planning_timeout * 60 if planning_timeout > 0 else None,
+        coding_timeout=coding_timeout * 60 if coding_timeout > 0 else None,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)

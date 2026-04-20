@@ -23,6 +23,8 @@ from ralph.console import (
     print_iteration_usage,
     print_max_iterations_reached,
     print_pacing_adjustment,
+    print_phase_header,
+    print_plan_extraction_result,
     print_prd_status,
     print_reeval_cancelled,
     print_reeval_changes,
@@ -35,6 +37,7 @@ from ralph.console import (
     print_retry_exhausted,
     print_task_list,
     print_timeout,
+    print_two_phase_summary,
     print_usage_critical,
     print_usage_warning,
     print_warning,
@@ -55,6 +58,8 @@ DEFAULT_MAX_RETRIES = 2  # per-iteration retry attempts
 RETRY_BACKOFF_BASE = 5.0  # seconds for first retry (5s, 15s, 45s with multiplier 3)
 DEFAULT_REEVAL_INTERVAL = 10  # Run re-evaluation every N iterations
 REEVAL_TIMEOUT = 5 * 60  # 5 minutes for re-evaluation
+DEFAULT_PLANNING_TIMEOUT = 10 * 60  # 10 minutes for planning phase
+DEFAULT_CODING_TIMEOUT = 30 * 60  # 30 minutes for coding phase
 
 # Adaptive pacing thresholds and multipliers
 DEFAULT_PACING_THRESHOLD_1 = 70.0  # 70% usage - 2x delay
@@ -89,6 +94,11 @@ class Runner:
         no_reeval: bool = False,
         reeval_confirm: bool = False,
         reeval_dry_run: bool = False,
+        two_phase: bool = False,
+        planning_tool: Tool = Tool.CLAUDE,
+        coding_tool: Tool = Tool.OPENCODE,
+        planning_timeout: float | None = DEFAULT_PLANNING_TIMEOUT,
+        coding_timeout: float | None = DEFAULT_CODING_TIMEOUT,
     ):
         self.prd_path = prd_path
         self.tool = tool
@@ -113,6 +123,13 @@ class Runner:
         self.no_reeval = no_reeval
         self.reeval_confirm = reeval_confirm
         self.reeval_dry_run = reeval_dry_run
+
+        # Two-phase orchestration configuration
+        self.two_phase = two_phase
+        self.planning_tool = planning_tool
+        self.coding_tool = coding_tool
+        self.planning_timeout = planning_timeout
+        self.coding_timeout = coding_timeout
 
         # Track last pacing multiplier to only log changes
         self._last_pacing_multiplier: float = 1.0
@@ -780,6 +797,135 @@ Ralph provides these commands to manage PRD state:
 
         return result, story_id
 
+    def _run_two_phase_iteration(self, iteration: int) -> tuple[ProcessResult, str | None]:
+        """
+        Run a single two-phase iteration (planning + coding).
+
+        Phase 1: Planning tool analyzes the story and creates a plan
+        Phase 2: Coding tool executes the plan
+
+        Returns:
+            Tuple of (ProcessResult from final phase, story ID or None)
+        """
+        from ralph.twophase import (
+            extract_plan,
+            run_coding_phase,
+            run_planning_phase,
+        )
+
+        logger.debug(f"_run_two_phase_iteration({iteration}) starting")
+
+        # Reload PRD to get latest state
+        prd = self._load_prd()
+        next_story = prd.get_next_story()
+        story_id = next_story.id if next_story else None
+
+        # Print iteration header
+        print_iteration_header(iteration, self.max_iterations, next_story)
+
+        # Display current tasks if enabled
+        self._display_tasks()
+
+        # Check if there's a story to work on
+        if next_story is None:
+            print_info("No incomplete stories found - all done!")
+            return ProcessResult(output="", return_code=0, completed=True), None
+
+        if self.verbose:
+            print_info(f"Two-phase mode: {self.planning_tool.value} (plan) + {self.coding_tool.value} (code)")
+
+        # Phase 1: Planning
+        print_phase_header(1, "Planning", self.planning_tool)
+
+        watcher = ConversationWatcher(self.base_dir)
+        watcher.start()
+
+        self._managed_process.reset()
+        output_handler = self._create_output_handler()
+
+        try:
+            planning_result, plan = run_planning_phase(
+                story=next_story,
+                prd=prd,
+                iteration=iteration,
+                max_iterations=self.max_iterations,
+                prd_path=self.prd_path,
+                tool=self.planning_tool,
+                cwd=self.base_dir,
+                on_output=output_handler,
+                managed_process=self._managed_process,
+                timeout=self.planning_timeout,
+            )
+        finally:
+            watcher.stop()
+
+        console.print()  # Newline after output
+
+        # Check for interruption
+        if planning_result.interrupted or self._interrupted:
+            logger.info("Planning phase interrupted")
+            return planning_result, story_id
+
+        # Check for timeout
+        if planning_result.timed_out:
+            print_timeout(iteration)
+            return planning_result, story_id
+
+        # Check if plan was extracted
+        print_plan_extraction_result(plan is not None, "No <implementation-plan> tags found" if not plan else None)
+
+        if not plan:
+            # Return the planning result so the outer loop can handle retry
+            return ProcessResult(
+                output=planning_result.output,
+                return_code=1,  # Non-zero to trigger retry
+                completed=False,
+                interrupted=False,
+                timed_out=False,
+            ), story_id
+
+        # Phase 2: Coding
+        print_phase_header(2, "Coding", self.coding_tool)
+
+        watcher = ConversationWatcher(self.base_dir)
+        watcher.start()
+
+        self._managed_process.reset()
+        output_handler = self._create_output_handler()
+
+        try:
+            coding_result = run_coding_phase(
+                story=next_story,
+                prd=prd,
+                plan=plan,
+                iteration=iteration,
+                max_iterations=self.max_iterations,
+                prd_path=self.prd_path,
+                tool=self.coding_tool,
+                cwd=self.base_dir,
+                on_output=output_handler,
+                managed_process=self._managed_process,
+                timeout=self.coding_timeout,
+            )
+        finally:
+            watcher.stop()
+
+        console.print()  # Newline after output
+
+        # Print summary
+        print_two_phase_summary(
+            planning_success=True,
+            coding_success=coding_result.return_code == 0 or coding_result.completed,
+            story_id=story_id,
+        )
+
+        logger.debug(
+            f"_run_two_phase_iteration({iteration}) complete: "
+            f"coding_returncode={coding_result.return_code}, completed={coding_result.completed}"
+        )
+
+        return coding_result, story_id
+
     def _run_iteration_with_retry(
         self, iteration: int
     ) -> tuple[ProcessResult, str | None]:
@@ -792,7 +938,11 @@ Ralph provides these commands to manage PRD state:
         Returns:
             Tuple of (ProcessResult from tool execution, story ID or None)
         """
-        result, story_id = self.run_iteration(iteration)
+        # Dispatch to two-phase or single-phase iteration
+        if self.two_phase:
+            result, story_id = self._run_two_phase_iteration(iteration)
+        else:
+            result, story_id = self.run_iteration(iteration)
 
         # Don't retry on success, timeout, interrupt, or completion
         if (
@@ -1036,13 +1186,18 @@ def run_ralph(
     no_reeval: bool = False,
     reeval_confirm: bool = True,
     reeval_dry_run: bool = False,
+    two_phase: bool = False,
+    planning_tool: Tool = Tool.CLAUDE,
+    coding_tool: Tool = Tool.OPENCODE,
+    planning_timeout: float | None = DEFAULT_PLANNING_TIMEOUT,
+    coding_timeout: float | None = DEFAULT_CODING_TIMEOUT,
 ) -> bool | int:
     """
     Convenience function to run Ralph.
 
     Args:
         prd_path: Path to the PRD file
-        tool: Which AI tool to use
+        tool: Which AI tool to use (ignored when two_phase=True)
         max_iterations: Maximum number of iterations
         verbose: Enable verbose output
         watch_tasks: Show Claude task list during execution
@@ -1059,6 +1214,11 @@ def run_ralph(
         no_reeval: Disable PRD re-evaluation entirely
         reeval_confirm: Require user confirmation before applying re-evaluation changes
         reeval_dry_run: Show what changes would be made without applying them
+        two_phase: Enable two-phase orchestration (planning + coding)
+        planning_tool: Tool for planning phase (default: Claude)
+        coding_tool: Tool for coding phase (default: OpenCode)
+        planning_timeout: Planning phase timeout in seconds
+        coding_timeout: Coding phase timeout in seconds
 
     Returns:
         True if all stories were completed
@@ -1085,5 +1245,10 @@ def run_ralph(
         no_reeval=no_reeval,
         reeval_confirm=reeval_confirm,
         reeval_dry_run=reeval_dry_run,
+        two_phase=two_phase,
+        planning_tool=planning_tool,
+        coding_tool=coding_tool,
+        planning_timeout=planning_timeout,
+        coding_timeout=coding_timeout,
     )
     return runner.run()

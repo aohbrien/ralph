@@ -23,6 +23,7 @@ class Tool(Enum):
     """Supported AI tools."""
     CLAUDE = "claude"
     AMP = "amp"
+    OPENCODE = "opencode"
 
 
 @dataclass
@@ -409,7 +410,7 @@ def run_tool_with_prompt(
     Run an AI tool with a prompt string.
 
     Args:
-        tool: Which AI tool to use (claude or amp)
+        tool: Which AI tool to use (claude, amp, or opencode)
         prompt: The prompt text to send to the tool
         on_output: Callback for streaming output
         cwd: Working directory
@@ -421,14 +422,22 @@ def run_tool_with_prompt(
     """
     if tool == Tool.CLAUDE:
         cmd = ["claude", "--dangerously-skip-permissions", "--print"]
-    else:  # Tool.AMP
+        input_text: str | None = prompt
+    elif tool == Tool.AMP:
         cmd = ["amp", "--dangerously-allow-all"]
+        input_text = prompt
+    elif tool == Tool.OPENCODE:
+        # OpenCode uses -p flag for prompt, -q for quiet/non-interactive
+        cmd = ["opencode", "-p", prompt, "-q"]
+        input_text = None  # Don't use stdin
+    else:
+        raise ValueError(f"Unknown tool: {tool}")
 
-    logger.debug(f"run_tool_with_prompt: cmd={cmd}, prompt_len={len(prompt)}")
+    logger.debug(f"run_tool_with_prompt: cmd={cmd[:2]}..., prompt_len={len(prompt)}")
 
     return stream_process(
         cmd=cmd,
-        input_text=prompt,
+        input_text=input_text,
         on_output=on_output,
         cwd=cwd,
         managed_process=managed_process,
