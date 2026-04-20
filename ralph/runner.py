@@ -99,6 +99,8 @@ class Runner:
         coding_tool: Tool = Tool.OPENCODE,
         planning_timeout: float | None = DEFAULT_PLANNING_TIMEOUT,
         coding_timeout: float | None = DEFAULT_CODING_TIMEOUT,
+        ccs_profile: str | None = None,
+        ccs_args: str | None = None,
     ):
         self.prd_path = prd_path
         self.tool = tool
@@ -130,6 +132,10 @@ class Runner:
         self.coding_tool = coding_tool
         self.planning_timeout = planning_timeout
         self.coding_timeout = coding_timeout
+
+        # ccs-specific configuration (profile + passthrough args)
+        self.ccs_profile = ccs_profile
+        self.ccs_args = ccs_args
 
         # Track last pacing multiplier to only log changes
         self._last_pacing_multiplier: float = 1.0
@@ -436,6 +442,8 @@ Ralph provides these commands to manage PRD state:
                 cwd=self.base_dir,
                 managed_process=self._managed_process,
                 timeout=REEVAL_TIMEOUT,
+                ccs_profile=self.ccs_profile,
+                ccs_args=self.ccs_args,
             )
         except Exception as e:
             print_reeval_error(f"Failed to run re-evaluation: {e}")
@@ -777,6 +785,8 @@ Ralph provides these commands to manage PRD state:
                 cwd=self.base_dir,
                 managed_process=self._managed_process,
                 timeout=self.timeout,
+                ccs_profile=self.ccs_profile,
+                ccs_args=self.ccs_args,
             )
         finally:
             logger.debug("Stopping conversation watcher...")
@@ -855,6 +865,8 @@ Ralph provides these commands to manage PRD state:
                 on_output=output_handler,
                 managed_process=self._managed_process,
                 timeout=self.planning_timeout,
+                ccs_profile=self.ccs_profile,
+                ccs_args=self.ccs_args,
             )
         finally:
             watcher.stop()
@@ -906,6 +918,8 @@ Ralph provides these commands to manage PRD state:
                 on_output=output_handler,
                 managed_process=self._managed_process,
                 timeout=self.coding_timeout,
+                ccs_profile=self.ccs_profile,
+                ccs_args=self.ccs_args,
             )
         finally:
             watcher.stop()
@@ -1191,6 +1205,8 @@ def run_ralph(
     coding_tool: Tool = Tool.OPENCODE,
     planning_timeout: float | None = DEFAULT_PLANNING_TIMEOUT,
     coding_timeout: float | None = DEFAULT_CODING_TIMEOUT,
+    ccs_profile: str | None = None,
+    ccs_args: str | None = None,
 ) -> bool | int:
     """
     Convenience function to run Ralph.
@@ -1250,5 +1266,7 @@ def run_ralph(
         coding_tool=coding_tool,
         planning_timeout=planning_timeout,
         coding_timeout=coding_timeout,
+        ccs_profile=ccs_profile,
+        ccs_args=ccs_args,
     )
     return runner.run()

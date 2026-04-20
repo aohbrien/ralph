@@ -70,7 +70,7 @@ ralph run --help
 
 Key options:
 - `--max-iterations, -n` - Maximum iterations (default: 10)
-- `--tool, -t` - AI tool: `claude` or `amp` (default: claude)
+- `--tool, -t` - AI tool: `claude`, `amp`, `opencode`, or `ccs` (default: claude)
 - `--timeout` - Per-iteration timeout in minutes (default: 30)
 - `--verbose, -v` - Enable verbose output
 - `--dry-run` - Show plan without executing

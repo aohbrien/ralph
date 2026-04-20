@@ -249,6 +249,8 @@ def run_planning_phase(
     on_output: Callable[[str], None] | None = None,
     managed_process: ManagedProcess | None = None,
     timeout: float | None = None,
+    ccs_profile: str | None = None,
+    ccs_args: str | None = None,
 ) -> tuple[ProcessResult, str | None]:
     """
     Run the planning phase of two-phase orchestration.
@@ -284,6 +286,8 @@ def run_planning_phase(
         cwd=cwd,
         managed_process=managed_process,
         timeout=timeout,
+        ccs_profile=ccs_profile,
+        ccs_args=ccs_args,
     )
 
     # Extract plan from output
@@ -309,6 +313,8 @@ def run_coding_phase(
     on_output: Callable[[str], None] | None = None,
     managed_process: ManagedProcess | None = None,
     timeout: float | None = None,
+    ccs_profile: str | None = None,
+    ccs_args: str | None = None,
 ) -> ProcessResult:
     """
     Run the coding phase of two-phase orchestration.
@@ -346,4 +352,6 @@ def run_coding_phase(
         cwd=cwd,
         managed_process=managed_process,
         timeout=timeout,
+        ccs_profile=ccs_profile,
+        ccs_args=ccs_args,
     )

@@ -7,6 +7,7 @@ import logging
 import os
 import pty
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -24,6 +25,7 @@ class Tool(Enum):
     CLAUDE = "claude"
     AMP = "amp"
     OPENCODE = "opencode"
+    CCS = "ccs"
 
 
 @dataclass
@@ -398,6 +400,11 @@ def run_tool(
     )
 
 
+# Default extra args appended to ccs invocations. Mirrors Tool.CLAUDE's hardcoded
+# --dangerously-skip-permissions (ccs forwards unknown flags to the underlying CLI).
+DEFAULT_CCS_ARGS = "--dangerously-skip-permissions"
+
+
 def run_tool_with_prompt(
     tool: Tool,
     prompt: str,
@@ -405,17 +412,23 @@ def run_tool_with_prompt(
     cwd: Path | None = None,
     managed_process: ManagedProcess | None = None,
     timeout: float | None = None,
+    ccs_profile: str | None = None,
+    ccs_args: str | None = None,
 ) -> ProcessResult:
     """
     Run an AI tool with a prompt string.
 
     Args:
-        tool: Which AI tool to use (claude, amp, or opencode)
+        tool: Which AI tool to use (claude, amp, opencode, or ccs)
         prompt: The prompt text to send to the tool
         on_output: Callback for streaming output
         cwd: Working directory
         managed_process: Optional ManagedProcess for external termination control
         timeout: Optional timeout in seconds (None = no timeout)
+        ccs_profile: Optional ccs profile/runtime name (e.g. "personal2"). Ignored unless tool is CCS.
+        ccs_args: Optional extra args passed through ccs to the underlying CLI
+            (shlex-split). Defaults to DEFAULT_CCS_ARGS when None. Pass "" to opt out.
+            Ignored unless tool is CCS.
 
     Returns:
         ProcessResult with output and completion status
@@ -429,6 +442,18 @@ def run_tool_with_prompt(
     elif tool == Tool.OPENCODE:
         # OpenCode uses -p flag for prompt, -q for quiet/non-interactive
         cmd = ["opencode", "-p", prompt, "-q"]
+        input_text = None  # Don't use stdin
+    elif tool == Tool.CCS:
+        # ccs syntax: `ccs [profile] [passthrough args...] -p <prompt>`.
+        # Profile selects the account/runtime; passthrough args are forwarded to
+        # the underlying CLI (e.g. --dangerously-skip-permissions for claude).
+        extras_raw = DEFAULT_CCS_ARGS if ccs_args is None else ccs_args
+        cmd = ["ccs"]
+        if ccs_profile:
+            cmd.append(ccs_profile)
+        if extras_raw:
+            cmd.extend(shlex.split(extras_raw))
+        cmd.extend(["-p", prompt])
         input_text = None  # Don't use stdin
     else:
         raise ValueError(f"Unknown tool: {tool}")

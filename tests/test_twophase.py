@@ -13,8 +13,10 @@ from pathlib import Path
 
 import pytest
 
+from unittest.mock import patch
+
 from ralph.prd import PRD, UserStory
-from ralph.process import Tool
+from ralph.process import Tool, run_tool_with_prompt
 from ralph.twophase import (
     IMPLEMENTATION_PLAN_END,
     IMPLEMENTATION_PLAN_START,
@@ -361,12 +363,56 @@ class TestToolEnum:
         """Test that OPENCODE tool is available."""
         assert Tool.OPENCODE.value == "opencode"
 
+    def test_ccs_tool_exists(self):
+        """Test that CCS tool is available."""
+        assert Tool.CCS.value == "ccs"
+
     def test_all_tools(self):
         """Test all tools are available."""
         tools = [t.value for t in Tool]
         assert "claude" in tools
         assert "amp" in tools
         assert "opencode" in tools
+        assert "ccs" in tools
+
+    def test_ccs_dispatch_defaults_include_dangerously_skip_permissions(self):
+        """By default ccs invocations pass --dangerously-skip-permissions through."""
+        with patch("ralph.process.stream_process") as mock_stream:
+            run_tool_with_prompt(Tool.CCS, "hello world")
+
+        assert mock_stream.call_count == 1
+        kwargs = mock_stream.call_args.kwargs
+        assert kwargs["cmd"] == ["ccs", "--dangerously-skip-permissions", "-p", "hello world"]
+        assert kwargs["input_text"] is None
+
+    def test_ccs_dispatch_with_profile_and_extra_args(self):
+        """ccs_profile is positional; ccs_args is shlex-split before -p."""
+        with patch("ralph.process.stream_process") as mock_stream:
+            run_tool_with_prompt(
+                Tool.CCS,
+                "hi",
+                ccs_profile="personal2",
+                ccs_args="--dangerously-skip-permissions --foo bar",
+            )
+
+        kwargs = mock_stream.call_args.kwargs
+        assert kwargs["cmd"] == [
+            "ccs",
+            "personal2",
+            "--dangerously-skip-permissions",
+            "--foo",
+            "bar",
+            "-p",
+            "hi",
+        ]
+
+    def test_ccs_dispatch_empty_ccs_args_opts_out_of_defaults(self):
+        """Passing ccs_args='' suppresses the default --dangerously-skip-permissions."""
+        with patch("ralph.process.stream_process") as mock_stream:
+            run_tool_with_prompt(Tool.CCS, "hi", ccs_profile="personal2", ccs_args="")
+
+        kwargs = mock_stream.call_args.kwargs
+        assert kwargs["cmd"] == ["ccs", "personal2", "-p", "hi"]
 
 
 # =============================================================================

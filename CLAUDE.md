@@ -67,9 +67,9 @@ mypy ralph
 
 **Process Execution**: `ralph/process.py`
 - Uses PTY for unbuffered real-time streaming output
-- `run_tool()` pipes prompt file to `claude --dangerously-skip-permissions --print`, `amp --dangerously-allow-all`, or `opencode -p <prompt> -q`
+- `run_tool()` pipes prompt file to `claude --dangerously-skip-permissions --print`, `amp --dangerously-allow-all`, `opencode -p <prompt> -q`, or `ccs -p <prompt>`
 - `ManagedProcess` allows external termination (for signal handlers)
-- Supports three tools: `claude`, `amp`, `opencode`
+- Supports four tools: `claude`, `amp`, `opencode`, `ccs`
 
 **Two-Phase Orchestration**: `ralph/twophase.py`
 - Separates planning and coding into two phases
@@ -126,8 +126,8 @@ ralph run --two-phase --prd path/to/prd.json
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--two-phase` | false | Enable two-phase orchestration |
-| `--planning-tool` | claude | Tool for planning: claude, amp, opencode |
-| `--coding-tool` | opencode | Tool for coding: claude, amp, opencode |
+| `--planning-tool` | claude | Tool for planning: claude, amp, opencode, ccs |
+| `--coding-tool` | opencode | Tool for coding: claude, amp, opencode, ccs |
 | `--planning-timeout` | 10 min | Planning phase timeout |
 | `--coding-timeout` | 30 min | Coding phase timeout |
 
@@ -163,6 +163,28 @@ OpenCode uses Gemini 3 Pro by default. Configure via `.opencode.json`:
   "model": "gemini-3-pro"
 }
 ```
+
+### CCS (Claude Code Switch)
+
+`ccs` is a wrapper that switches between Claude accounts and other runtimes (Codex, GLM, OpenRouter, etc.) under a stable command surface. Install and configure separately:
+
+```bash
+npm install -g @kaitranntt/ccs
+ccs config
+```
+
+Ralph invokes it as `ccs [profile] [passthrough args...] -p <prompt>`:
+
+- `--ccs-profile <name>` — ccs profile/runtime name (e.g. `personal2`). Passed as the first positional arg.
+- `--ccs-args "<flags>"` — extra args forwarded through ccs to the underlying CLI. Defaults to `--dangerously-skip-permissions` (matches how Ralph invokes `claude` directly). Pass `--ccs-args ""` to suppress the default.
+
+Example matching the typical `ccs personal2 --dangerously-skip-permissions` invocation:
+
+```bash
+ralph run --tool ccs --ccs-profile personal2 --prd prd.json
+```
+
+Both flags are also available on `ralph resume` and work with `--planning-tool ccs` / `--coding-tool ccs` in two-phase mode.
 
 ## Completion Protocol
 

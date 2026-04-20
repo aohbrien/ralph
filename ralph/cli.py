@@ -82,7 +82,7 @@ def run(
         "claude",
         "--tool",
         "-t",
-        help="AI tool to use: claude or amp",
+        help="AI tool to use: claude, amp, opencode, or ccs",
     ),
     prd: Path = typer.Option(
         Path("prd.json"),
@@ -200,12 +200,12 @@ def run(
     planning_tool: str = typer.Option(
         "claude",
         "--planning-tool",
-        help="Tool for planning phase: claude, amp, or opencode",
+        help="Tool for planning phase: claude, amp, opencode, or ccs",
     ),
     coding_tool: str = typer.Option(
         "opencode",
         "--coding-tool",
-        help="Tool for coding phase: claude, amp, or opencode",
+        help="Tool for coding phase: claude, amp, opencode, or ccs",
     ),
     planning_timeout: int = typer.Option(
         10,
@@ -216,6 +216,21 @@ def run(
         30,
         "--coding-timeout",
         help="Coding phase timeout in minutes (default: 30)",
+    ),
+    ccs_profile: Optional[str] = typer.Option(
+        None,
+        "--ccs-profile",
+        help="ccs profile/runtime name (e.g. 'personal2'). Only used when tool is ccs.",
+    ),
+    ccs_args: Optional[str] = typer.Option(
+        None,
+        "--ccs-args",
+        help=(
+            "Extra args passed through ccs to the underlying CLI "
+            "(e.g. '--dangerously-skip-permissions'). Defaults to "
+            "'--dangerously-skip-permissions'; pass '' to opt out. "
+            "Only used when tool is ccs."
+        ),
     ),
 ) -> None:
     """Run the Ralph autonomous agent loop."""
@@ -244,7 +259,7 @@ def run(
     try:
         tool_enum = Tool(tool.lower())
     except ValueError:
-        print_error(f"Invalid tool: {tool}. Must be 'claude', 'amp', or 'opencode'")
+        print_error(f"Invalid tool: {tool}. Must be 'claude', 'amp', 'opencode', or 'ccs'")
         raise typer.Exit(1)
 
     # Parse two-phase tools if enabled
@@ -254,12 +269,12 @@ def run(
         try:
             planning_tool_enum = Tool(planning_tool.lower())
         except ValueError:
-            print_error(f"Invalid planning tool: {planning_tool}. Must be 'claude', 'amp', or 'opencode'")
+            print_error(f"Invalid planning tool: {planning_tool}. Must be 'claude', 'amp', 'opencode', or 'ccs'")
             raise typer.Exit(1)
         try:
             coding_tool_enum = Tool(coding_tool.lower())
         except ValueError:
-            print_error(f"Invalid coding tool: {coding_tool}. Must be 'claude', 'amp', or 'opencode'")
+            print_error(f"Invalid coding tool: {coding_tool}. Must be 'claude', 'amp', 'opencode', or 'ccs'")
             raise typer.Exit(1)
 
     # Load PRD
@@ -383,6 +398,8 @@ def run(
         coding_tool=coding_tool_enum,
         planning_timeout=planning_timeout * 60 if planning_timeout > 0 else None,
         coding_timeout=coding_timeout * 60 if coding_timeout > 0 else None,
+        ccs_profile=ccs_profile,
+        ccs_args=ccs_args,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -661,7 +678,7 @@ def resume(
         "claude",
         "--tool",
         "-t",
-        help="AI tool to use: claude or amp",
+        help="AI tool to use: claude, amp, opencode, or ccs",
     ),
     prd: Path = typer.Option(
         Path("prd.json"),
@@ -753,12 +770,12 @@ def resume(
     planning_tool: str = typer.Option(
         "claude",
         "--planning-tool",
-        help="Tool for planning phase: claude, amp, or opencode",
+        help="Tool for planning phase: claude, amp, opencode, or ccs",
     ),
     coding_tool: str = typer.Option(
         "opencode",
         "--coding-tool",
-        help="Tool for coding phase: claude, amp, or opencode",
+        help="Tool for coding phase: claude, amp, opencode, or ccs",
     ),
     planning_timeout: int = typer.Option(
         10,
@@ -769,6 +786,21 @@ def resume(
         30,
         "--coding-timeout",
         help="Coding phase timeout in minutes (default: 30)",
+    ),
+    ccs_profile: Optional[str] = typer.Option(
+        None,
+        "--ccs-profile",
+        help="ccs profile/runtime name (e.g. 'personal2'). Only used when tool is ccs.",
+    ),
+    ccs_args: Optional[str] = typer.Option(
+        None,
+        "--ccs-args",
+        help=(
+            "Extra args passed through ccs to the underlying CLI "
+            "(e.g. '--dangerously-skip-permissions'). Defaults to "
+            "'--dangerously-skip-permissions'; pass '' to opt out. "
+            "Only used when tool is ccs."
+        ),
     ),
 ) -> None:
     """Resume a previously interrupted run."""
@@ -792,7 +824,7 @@ def resume(
     try:
         tool_enum = Tool(tool.lower())
     except ValueError:
-        print_error(f"Invalid tool: {tool}. Must be 'claude', 'amp', or 'opencode'")
+        print_error(f"Invalid tool: {tool}. Must be 'claude', 'amp', 'opencode', or 'ccs'")
         raise typer.Exit(1)
 
     # Parse two-phase tools if enabled
@@ -802,12 +834,12 @@ def resume(
         try:
             planning_tool_enum = Tool(planning_tool.lower())
         except ValueError:
-            print_error(f"Invalid planning tool: {planning_tool}. Must be 'claude', 'amp', or 'opencode'")
+            print_error(f"Invalid planning tool: {planning_tool}. Must be 'claude', 'amp', 'opencode', or 'ccs'")
             raise typer.Exit(1)
         try:
             coding_tool_enum = Tool(coding_tool.lower())
         except ValueError:
-            print_error(f"Invalid coding tool: {coding_tool}. Must be 'claude', 'amp', or 'opencode'")
+            print_error(f"Invalid coding tool: {coding_tool}. Must be 'claude', 'amp', 'opencode', or 'ccs'")
             raise typer.Exit(1)
 
     # Parse limit mode
@@ -860,6 +892,8 @@ def resume(
         coding_tool=coding_tool_enum,
         planning_timeout=planning_timeout * 60 if planning_timeout > 0 else None,
         coding_timeout=coding_timeout * 60 if coding_timeout > 0 else None,
+        ccs_profile=ccs_profile,
+        ccs_args=ccs_args,
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
