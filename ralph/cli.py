@@ -436,6 +436,48 @@ def status(
 
 
 @app.command()
+def dashboard(
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        help="Host/interface to bind. Defaults to loopback. Non-loopback addresses emit a warning — there is no auth yet.",
+    ),
+    port: int = typer.Option(
+        8765,
+        "--port",
+        help="Port to bind. Falls back to the next free port in a 10-port window if busy.",
+    ),
+    refresh: float = typer.Option(
+        1.5,
+        "--refresh",
+        help="Browser poll interval in seconds.",
+        min=0.25,
+        max=60.0,
+    ),
+    open_browser: bool = typer.Option(
+        False,
+        "--open/--no-open",
+        help="Open the dashboard in the default browser once the server is up.",
+    ),
+) -> None:
+    """Serve a live dashboard of all active ralph instances on this machine."""
+    from ralph.dashboard.server import run_server
+
+    if open_browser:
+        import threading
+        import time
+        import webbrowser
+
+        def _open_later() -> None:
+            time.sleep(0.5)
+            webbrowser.open(f"http://{host}:{port}/")
+
+        threading.Thread(target=_open_later, daemon=True).start()
+
+    run_server(host=host, port=port, refresh_seconds=refresh)
+
+
+@app.command()
 def archive(
     prd: Path = typer.Option(
         Path("prd.json"),

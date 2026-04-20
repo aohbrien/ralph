@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
-from typing import Callable, cast
+from typing import Any, Callable, cast
 
 logger = logging.getLogger("ralph.runner")
 
@@ -44,6 +44,11 @@ from ralph.console import (
     prompt_reeval_confirmation,
 )
 from ralph.conversation import ConversationWatcher
+from ralph.dashboard.reporter import (
+    DashboardReporter,
+    InstanceMetadata,
+    NULL_REPORTER,
+)
 from ralph.prd import PRD, UserStory
 from ralph.process import ManagedProcess, ProcessResult, Tool, run_tool_with_prompt
 from ralph.session import SessionManager, get_budget_for_session, update_heartbeat
@@ -154,6 +159,11 @@ class Runner:
         # Run state for resume functionality
         self._run_state: RunState | None = None
         self._start_iteration = 1
+
+        # Dashboard reporter — publishes instance state to ~/.ralph/instances/
+        # Lifecycle managed inside run() so tests that construct Runner directly
+        # without calling run() don't leave stale state files.
+        self._reporter: Any = NULL_REPORTER
 
     def _get_prompt_path(self) -> Path:
         """Get the prompt file path for the current tool."""
@@ -337,11 +347,18 @@ Ralph provides these commands to manage PRD state:
     def _create_output_handler(self) -> Callable[[str], None]:
         """Create a handler for streaming output."""
         import os
+        reporter = self._reporter
         def handler(text: str) -> None:
             # Write directly to fd 2 (stderr) for unbuffered real-time output
             # This bypasses Python's sys.stderr which can be buffered or intercepted by Rich/Typer
             # This is equivalent to what `tee /dev/stderr` was doing before
             os.write(2, text.encode())
+            # Tee to the dashboard tail. The reporter is thread-safe and no-ops
+            # when nothing has called start() yet.
+            try:
+                reporter.on_output_line(text)
+            except Exception:
+                pass
         return handler
 
     def _display_tasks(self) -> None:
@@ -406,6 +423,11 @@ Ralph provides these commands to manage PRD state:
 
         # Load current PRD
         prd = self._load_prd()
+        passing, total = prd.get_progress()
+        self._reporter.on_iteration_start(
+            iteration, None, phase="reeval",
+            prd_passing=passing, prd_total=total,
+        )
 
         # Check if there are any pending stories to evaluate
         pending_count = sum(1 for s in prd.user_stories if not s.passes)
@@ -612,6 +634,39 @@ Ralph provides these commands to manage PRD state:
             logger.debug(f"Usage tracking failed: {e}")
             return None
 
+    def _build_usage_snapshot(self) -> dict[str, Any]:
+        """Compact usage summary for the dashboard. Swallows any failure — the
+        dashboard is strictly informational and must never break the run."""
+        try:
+            from ralph.config import get_plan, get_plan_limits
+            from ralph.usage import get_5hour_window_usage
+
+            if self.five_hour_limit is not None:
+                limit = self.five_hour_limit
+            else:
+                current_plan = get_plan()
+                limits = get_plan_limits(current_plan)
+                limit = limits["5hour_tokens"]
+
+            if limit <= 0:
+                return {}
+
+            usage = get_5hour_window_usage()
+            total_used = usage.rate_limited_tokens
+            remaining = max(0, limit - total_used)
+            session_budget, num_sessions = get_budget_for_session(remaining)
+            effective_limit = max(1, total_used + session_budget)
+            percentage = min(100.0, (total_used / effective_limit) * 100)
+            return {
+                "tokens_used": total_used,
+                "five_hour_limit": limit,
+                "allocated_budget": session_budget,
+                "num_sessions": num_sessions,
+                "percentage": percentage,
+            }
+        except Exception:
+            return {}
+
     def _calculate_adaptive_delay(self, usage_percentage: float | None) -> tuple[float, float]:
         """
         Calculate the adaptive iteration delay based on usage percentage.
@@ -753,6 +808,11 @@ Ralph provides these commands to manage PRD state:
 
         # Print iteration header
         print_iteration_header(iteration, self.max_iterations, next_story)
+        passing, total = prd.get_progress()
+        self._reporter.on_iteration_start(
+            iteration, next_story, phase="single",
+            prd_passing=passing, prd_total=total,
+        )
 
         # Display current tasks if enabled
         self._display_tasks()
@@ -832,6 +892,11 @@ Ralph provides these commands to manage PRD state:
 
         # Print iteration header
         print_iteration_header(iteration, self.max_iterations, next_story)
+        passing, total = prd.get_progress()
+        self._reporter.on_iteration_start(
+            iteration, next_story, phase="planning",
+            prd_passing=passing, prd_total=total,
+        )
 
         # Display current tasks if enabled
         self._display_tasks()
@@ -898,6 +963,11 @@ Ralph provides these commands to manage PRD state:
 
         # Phase 2: Coding
         print_phase_header(2, "Coding", self.coding_tool)
+        passing, total = prd.get_progress()
+        self._reporter.on_iteration_start(
+            iteration, next_story, phase="coding",
+            prd_passing=passing, prd_total=total,
+        )
 
         watcher = ConversationWatcher(self.base_dir)
         watcher.start()
@@ -1013,6 +1083,9 @@ Ralph provides these commands to manage PRD state:
         self._install_signal_handlers()
         logger.debug("Signal handlers installed")
 
+        # Construct the dashboard reporter lazily so tests that build a
+        # Runner without invoking run() don't touch ~/.ralph/instances.
+        self._reporter = DashboardReporter()
         try:
             # Use SessionManager for cross-session coordination
             # This registers our session and automatically cleans up on exit
@@ -1026,6 +1099,10 @@ Ralph provides these commands to manage PRD state:
             if self._managed_process.process is not None:
                 logger.debug("Terminating any remaining subprocess...")
                 self._managed_process.terminate()
+            try:
+                self._reporter.close()
+            except Exception:
+                logger.debug("Dashboard reporter close() raised", exc_info=True)
             self._restore_signal_handlers()
             logger.debug("Cleanup complete")
 
@@ -1036,6 +1113,21 @@ Ralph provides these commands to manage PRD state:
         # Load initial PRD
         logger.debug("Loading initial PRD...")
         prd = self._load_prd()
+
+        # Start publishing to the dashboard now that we know the PRD metadata.
+        initial_passing, initial_total = prd.get_progress()
+        self._reporter.start(
+            InstanceMetadata(
+                prd_path=self.prd_path,
+                prd_project=prd.project or None,
+                tool=self.tool.value if not self.two_phase else self.coding_tool.value,
+                two_phase=self.two_phase,
+                max_iterations=self.max_iterations,
+                cwd=self.base_dir,
+            ),
+            prd_passing=initial_passing,
+            prd_total=initial_total,
+        )
 
         # Handle resume if requested
         if self.resume:
@@ -1119,6 +1211,18 @@ Ralph provides these commands to manage PRD state:
             prd = self._load_prd()
             self._save_run_state(iteration, story_id, len(prd.user_stories))
 
+            # Publish this iteration's outcome + PRD progress to the dashboard.
+            passing, total = prd.get_progress()
+            self._reporter.on_iteration_end(
+                return_code=result.return_code,
+                completed=result.completed,
+                timed_out=result.timed_out,
+                interrupted=result.interrupted,
+                prd_passing=passing,
+                prd_total=total,
+                usage=self._build_usage_snapshot(),
+            )
+
             # Display current usage after each iteration (with warnings if thresholds exceeded)
             # Skip if interrupted to avoid slow usage parsing during shutdown
             if not self._interrupted:
@@ -1174,6 +1278,7 @@ Ralph provides these commands to manage PRD state:
                 # Update session heartbeat during delay
                 logger.debug("Updating session heartbeat...")
                 update_heartbeat()
+                self._reporter.heartbeat(usage=self._build_usage_snapshot())
                 logger.debug("Heartbeat updated")
 
         # Max iterations reached without completion
