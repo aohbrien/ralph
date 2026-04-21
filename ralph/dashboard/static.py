@@ -78,6 +78,13 @@ _TEMPLATE = """<!doctype html>
   .bar > span.bad { background: var(--bad); }
   .bar-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center;
     font-size: 11px; color: var(--muted); }
+  .bucket { margin-top: 6px; }
+  .bucket .bar-row .ident { color: var(--fg); font-weight: 500; }
+  .bucket .bar-row .ident.active::after { content: ' ◀'; color: var(--accent); }
+  .bucket .forecast { font-size: 10px; color: var(--muted); margin-top: 2px;
+    text-align: right; }
+  .bucket-source { color: var(--muted); font-size: 10px; margin-left: 4px;
+    text-transform: uppercase; letter-spacing: 0.04em; }
   pre.tail { background: #070809; border: 1px solid var(--border); border-radius: 6px;
     padding: 8px 10px; font-size: 11px; line-height: 1.4; height: 160px; overflow: auto;
     white-space: pre-wrap; word-break: break-all; margin: 0; }
@@ -159,6 +166,7 @@ function createCard(pid) {
       </div>
       <div class="bar"><span data-f="usage-bar"></span></div>
     </div>
+    <div data-f="buckets-wrap" hidden></div>
     <pre class="tail" data-f="tail">loading\u2026</pre>
     <div class="row tiny">
       <span data-f="ident"></span>
@@ -203,16 +211,42 @@ function updateCard(card, inst) {
   }
 
   const usage = inst.usage || {};
-  const usagePct = typeof usage.percentage === 'number' ? usage.percentage : null;
+  const buckets = Array.isArray(usage.buckets) ? usage.buckets : [];
   const usageWrap = f('usage-wrap');
-  if (usagePct != null) {
-    usageWrap.hidden = false;
-    f('usage-label').textContent = `${usagePct.toFixed(1)}%`;
-    const bar = f('usage-bar');
-    bar.className = progressClass(usagePct);
-    bar.style.width = Math.min(100, usagePct) + '%';
-  } else {
+  const bucketsWrap = f('buckets-wrap');
+
+  if (buckets.length >= 2) {
+    // Multi-bucket view: one bar per (provider, account). This is the new
+    // mode triggered by --ccs-pool or when running through CCS with multiple
+    // discovered accounts. The single-bar view is hidden in this case to
+    // avoid double-counting.
     usageWrap.hidden = true;
+    bucketsWrap.hidden = false;
+    bucketsWrap.innerHTML = buckets.map(renderBucket).join('');
+  } else if (buckets.length === 1) {
+    // Exactly one bucket — render as the classic single bar so CCS users
+    // with just one configured profile see the same UI as host-claude.
+    bucketsWrap.hidden = true;
+    usageWrap.hidden = false;
+    const b = buckets[0];
+    const pct = typeof b.percentage === 'number' ? b.percentage : 0;
+    f('usage-label').textContent = `${b.identity || 'anthropic'} · ${pct.toFixed(1)}%`;
+    const bar = f('usage-bar');
+    bar.className = progressClass(pct);
+    bar.style.width = Math.min(100, pct) + '%';
+  } else {
+    // Legacy / no-buckets: fall back to the flat usage.percentage field.
+    bucketsWrap.hidden = true;
+    const usagePct = typeof usage.percentage === 'number' ? usage.percentage : null;
+    if (usagePct != null) {
+      usageWrap.hidden = false;
+      f('usage-label').textContent = `${usagePct.toFixed(1)}%`;
+      const bar = f('usage-bar');
+      bar.className = progressClass(usagePct);
+      bar.style.width = Math.min(100, usagePct) + '%';
+    } else {
+      usageWrap.hidden = true;
+    }
   }
 
   const startedAge = fmtDuration(ageSeconds(inst.started_at));
@@ -226,6 +260,62 @@ function escapeHtml(s) {
   if (s == null) return '';
   return String(s).replace(/[&<>"']/g, c =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function fmtTokens(n) {
+  if (typeof n !== 'number' || !isFinite(n)) return '?';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(0) + 'k';
+  return String(n);
+}
+
+function renderBucket(b) {
+  const pct = typeof b.percentage === 'number' ? b.percentage : 0;
+  const cls = progressClass(pct);
+  const active = b.is_active ? ' active' : '';
+  const ident = escapeHtml(b.identity || b.account || 'anthropic');
+  const source = b.source && b.source !== 'jsonl' && b.source !== 'empty'
+    ? `<span class="bucket-source">${escapeHtml(b.source)}</span>` : '';
+
+  // Limit provenance — tells the user whether the denominator is real or a guess.
+  let limitTag = '';
+  if (b.limit_source === 'detected' || b.limit_source === 'cached') {
+    const hits = typeof b.limit_hit_count === 'number' ? b.limit_hit_count : 0;
+    limitTag = `detected from ${hits} hit${hits === 1 ? '' : 's'}`;
+  } else if (b.limit_source === 'override') {
+    limitTag = 'override';
+  } else {
+    limitTag = 'default';
+  }
+
+  let forecast = '';
+  if (typeof b.forecast_iters_to_90 === 'number' && b.forecast_iters_to_90 > 0) {
+    forecast = `forecast: 90% in ~${b.forecast_iters_to_90} iter${b.forecast_iters_to_90 === 1 ? '' : 's'}`;
+  } else if (pct >= 90 && typeof b.forecast_iters_to_100 === 'number' && b.forecast_iters_to_100 > 0) {
+    forecast = `forecast: saturate in ~${b.forecast_iters_to_100} iter${b.forecast_iters_to_100 === 1 ? '' : 's'}`;
+  }
+
+  // Show a range when the single max-observed window is higher than the
+  // conservative P90 ceiling we pace against — tells the user "you've burst
+  // higher than we're treating as your cap". For accounts where P90 ≈ max
+  // (consistent usage) the display stays compact.
+  const isEmpirical = b.limit_source === 'detected' || b.limit_source === 'cached';
+  const maxObs = typeof b.limit_max_observed === 'number' ? b.limit_max_observed : 0;
+  const limitStr = (isEmpirical && maxObs > b.limit)
+    ? `${fmtTokens(b.limit)} (P90) — max ${fmtTokens(maxObs)}`
+    : fmtTokens(b.limit);
+
+  const limitLine = `limit ${limitStr} · ${escapeHtml(limitTag)}`;
+  const subtext = forecast ? `${limitLine} · ${forecast}` : limitLine;
+
+  return `<div class="bucket">
+    <div class="bar-row">
+      <span class="ident${active}">${ident}${source}</span>
+      <span>${pct.toFixed(1)}%</span>
+    </div>
+    <div class="bar"><span class="${cls}" style="width:${Math.min(100, pct)}%"></span></div>
+    <div class="forecast">${subtext}</div>
+  </div>`;
 }
 
 async function fetchTail(pid, el) {

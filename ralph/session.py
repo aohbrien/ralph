@@ -14,7 +14,7 @@ import os
 import signal
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,17 @@ class SessionInfo:
     prd_path: str | None = None
     allocated_budget: int = 0  # Tokens allocated to this session
 
+    # Account-rotation coordination (--ccs-pool). `active_account` is the CCS
+    # account this session is currently drawing from; `iter_estimate_tokens` is
+    # how much we expect this iteration to cost (EMA). Peers use these fields
+    # to avoid hotspotting: if two instances both pick "personal2", the second
+    # one sees the first's claim and re-scores to pick a different account.
+    # `claim_expires_at` ensures a crashed instance's claim doesn't strand an
+    # account — callers ignore claims whose expiry is in the past.
+    active_account: str | None = None
+    iter_estimate_tokens: int = 0
+    claim_expires_at: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -46,6 +57,9 @@ class SessionInfo:
             "last_heartbeat": self.last_heartbeat,
             "prd_path": self.prd_path,
             "allocated_budget": self.allocated_budget,
+            "active_account": self.active_account,
+            "iter_estimate_tokens": self.iter_estimate_tokens,
+            "claim_expires_at": self.claim_expires_at,
         }
 
     @classmethod
@@ -57,7 +71,23 @@ class SessionInfo:
             last_heartbeat=data["last_heartbeat"],
             prd_path=data.get("prd_path"),
             allocated_budget=data.get("allocated_budget", 0),
+            active_account=data.get("active_account"),
+            iter_estimate_tokens=data.get("iter_estimate_tokens", 0),
+            claim_expires_at=data.get("claim_expires_at"),
         )
+
+    @property
+    def claim_is_active(self) -> bool:
+        """True if this session currently holds a non-expired account claim."""
+        if self.active_account is None or self.claim_expires_at is None:
+            return False
+        try:
+            expires = datetime.fromisoformat(self.claim_expires_at)
+        except (ValueError, TypeError):
+            return False
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) < expires
 
     def is_stale(self, threshold_seconds: int = STALE_SESSION_THRESHOLD_SECONDS) -> bool:
         """Check if this session is stale (last heartbeat > threshold ago)."""
@@ -568,6 +598,157 @@ class SessionManager:
         if self.session is not None:
             return update_heartbeat(self.session.pid, self.lock_file)
         return False
+
+
+def set_session_claim(
+    active_account: str,
+    iter_estimate_tokens: int,
+    claim_duration_seconds: float,
+    pid: int | None = None,
+    lock_file: Path = DEFAULT_LOCK_FILE,
+) -> bool:
+    """Record that this session is drawing from a specific account this iteration.
+
+    Peer sessions read these claims via ``get_concurrent_claims()`` to avoid
+    piling onto the same account. A claim is only honored until
+    ``claim_expires_at`` — if this session crashes mid-iteration, the claim
+    auto-lapses rather than stranding the account.
+
+    Args:
+        active_account: The account identifier this session is drawing from.
+        iter_estimate_tokens: EMA forecast of this iteration's cost.
+        claim_duration_seconds: How long the claim is valid for (e.g., iteration
+            timeout + small slack).
+        pid: PID to update (defaults to this process).
+        lock_file: Registry file path.
+
+    Returns:
+        True if the session's claim was updated; False if not registered.
+    """
+    if pid is None:
+        pid = os.getpid()
+
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=claim_duration_seconds)
+    ).isoformat()
+
+    try:
+        registry, f = _read_registry_locked(lock_file)
+        session = registry.get_session(pid)
+        if session is None:
+            _write_registry_and_unlock(registry, lock_file, f)
+            return False
+        session.active_account = active_account
+        session.iter_estimate_tokens = int(iter_estimate_tokens)
+        session.claim_expires_at = expires_at
+        registry.add_session(session)
+        _write_registry_and_unlock(registry, lock_file, f)
+        return True
+    except (OSError, IOError) as e:
+        logger.warning(f"Failed to set session claim: {e}")
+        return False
+
+
+def clear_session_claim(
+    pid: int | None = None,
+    lock_file: Path = DEFAULT_LOCK_FILE,
+) -> bool:
+    """Release this session's account claim (called at iteration end)."""
+    if pid is None:
+        pid = os.getpid()
+
+    try:
+        registry, f = _read_registry_locked(lock_file)
+        session = registry.get_session(pid)
+        if session is None:
+            _write_registry_and_unlock(registry, lock_file, f)
+            return False
+        session.active_account = None
+        session.iter_estimate_tokens = 0
+        session.claim_expires_at = None
+        registry.add_session(session)
+        _write_registry_and_unlock(registry, lock_file, f)
+        return True
+    except (OSError, IOError) as e:
+        logger.warning(f"Failed to clear session claim: {e}")
+        return False
+
+
+def get_concurrent_claims(
+    exclude_pid: int | None = None,
+    lock_file: Path = DEFAULT_LOCK_FILE,
+) -> dict[str, int]:
+    """Sum live, non-expired iter_estimate_tokens from peer sessions by account.
+
+    Args:
+        exclude_pid: PID to exclude from the sum (typically the caller's own).
+        lock_file: Registry file path.
+
+    Returns:
+        Mapping of account name -> total estimated in-flight tokens. Accounts
+        with no active claims don't appear in the dict (caller can default to 0).
+    """
+    if exclude_pid is None:
+        exclude_pid = os.getpid()
+
+    totals: dict[str, int] = {}
+    for peer in get_active_sessions(lock_file, cleanup_stale=True):
+        if peer.pid == exclude_pid:
+            continue
+        if not peer.claim_is_active:
+            continue
+        account = peer.active_account
+        if account is None:
+            continue
+        totals[account] = totals.get(account, 0) + max(0, peer.iter_estimate_tokens)
+    return totals
+
+
+def pick_least_loaded_account(
+    pool: list[str],
+    headroom_by_account: dict[str, int],
+    exclude_pid: int | None = None,
+    lock_file: Path = DEFAULT_LOCK_FILE,
+) -> str | None:
+    """Pick the pool account with the greatest effective headroom across all
+    live Ralph instances.
+
+    Effective headroom = this-session's static headroom (limit minus already-
+    consumed tokens) minus the sum of peer claims against that account. If all
+    accounts are saturated (effective headroom <= 0 everywhere), returns the
+    least-bad choice (highest effective, possibly negative) rather than None —
+    the runner's preflight layer is responsible for blocking when the budget is
+    truly exhausted.
+
+    Args:
+        pool: Candidate account names (e.g. ``["personal", "personal2"]``).
+        headroom_by_account: Static headroom for each account, i.e.
+            ``limit - already_used`` as this session sees it.
+        exclude_pid: PID to exclude (typically our own).
+        lock_file: Registry file path.
+
+    Returns:
+        The chosen account name, or None if the pool is empty.
+    """
+    if not pool:
+        return None
+
+    claims = get_concurrent_claims(exclude_pid=exclude_pid, lock_file=lock_file)
+
+    scored: list[tuple[int, str]] = []
+    for account in pool:
+        static = headroom_by_account.get(account, 0)
+        peer_load = claims.get(account, 0)
+        effective = static - peer_load
+        scored.append((effective, account))
+
+    # Stable tiebreak: highest effective headroom wins; for ties, preserve
+    # pool-declaration order (earlier entries win) by including the index.
+    scored_with_index = [
+        (eff, -i, name) for i, (eff, name) in enumerate(scored)
+    ]
+    scored_with_index.sort(reverse=True)
+    return scored_with_index[0][2]
 
 
 def get_budget_for_session(

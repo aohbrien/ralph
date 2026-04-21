@@ -48,6 +48,18 @@ app = typer.Typer(
 console = Console()
 
 
+def _parse_ccs_pool(raw: Optional[str]) -> Optional[list[str]]:
+    """Split a --ccs-pool string into a list of accounts.
+
+    Returns None if empty/unset. Trims whitespace and drops empty entries so
+    ``--ccs-pool "personal,,personal2 "`` yields ``["personal", "personal2"]``.
+    """
+    if raw is None:
+        return None
+    accounts = [a.strip() for a in raw.split(",") if a.strip()]
+    return accounts or None
+
+
 def version_callback(value: bool) -> None:
     """Print version and exit."""
     if value:
@@ -232,6 +244,17 @@ def run(
             "Only used when tool is ccs."
         ),
     ),
+    ccs_pool: Optional[str] = typer.Option(
+        None,
+        "--ccs-pool",
+        help=(
+            "Comma-separated list of CCS accounts to rotate across "
+            "(e.g. 'personal,personal2,personal3'). Before each iteration Ralph "
+            "picks the account with the most headroom, and publishes a claim so "
+            "concurrent Ralph instances don't hotspot the same account. "
+            "Overrides --ccs-profile."
+        ),
+    ),
 ) -> None:
     """Run the Ralph autonomous agent loop."""
     import logging
@@ -400,6 +423,7 @@ def run(
         coding_timeout=coding_timeout * 60 if coding_timeout > 0 else None,
         ccs_profile=ccs_profile,
         ccs_args=ccs_args,
+        ccs_pool=_parse_ccs_pool(ccs_pool),
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -844,6 +868,13 @@ def resume(
             "Only used when tool is ccs."
         ),
     ),
+    ccs_pool: Optional[str] = typer.Option(
+        None,
+        "--ccs-pool",
+        help=(
+            "Comma-separated CCS accounts to rotate across. Overrides --ccs-profile."
+        ),
+    ),
 ) -> None:
     """Resume a previously interrupted run."""
     from ralph.logging_config import setup_logging
@@ -936,6 +967,7 @@ def resume(
         coding_timeout=coding_timeout * 60 if coding_timeout > 0 else None,
         ccs_profile=ccs_profile,
         ccs_args=ccs_args,
+        ccs_pool=_parse_ccs_pool(ccs_pool),
     )
 
     # Handle return value: True (success), False (max iterations), or int (exit code)
@@ -1063,6 +1095,15 @@ def usage(
         "--no-costs",
         help="Hide cost information in display",
     ),
+    redetect: bool = typer.Option(
+        False,
+        "--redetect",
+        help=(
+            "Wipe the per-account detected-limit cache and recompute. "
+            "Useful after Anthropic changes plan caps, or when you "
+            "switch a CCS account to a different plan."
+        ),
+    ),
 ) -> None:
     """Show usage statistics and manage plan configuration."""
     from ralph.usage import (
@@ -1083,6 +1124,12 @@ def usage(
         except ValueError as e:
             print_error(str(e))
             raise typer.Exit(1)
+
+    # --redetect: bust the per-account detected-limit cache before display.
+    if redetect:
+        from ralph.limit_detector import clear_detection_cache
+        n = clear_detection_cache()
+        print_info(f"Cleared {n} cached limit detection(s).")
 
     # Get current plan and effective limits (respects limit_mode config)
     current_plan = get_plan()
@@ -1138,6 +1185,70 @@ def usage(
         show_costs=not no_costs,
         p90_limit=p90_limit,
     )
+
+    # If CCS accounts are present, also show a compact per-account summary so
+    # the user can see which account is hot vs. idle without running the
+    # dashboard. Host-claude-only users never see this block.
+    _print_ccs_account_sections(limits["5hour_tokens"])
+
+
+def _print_ccs_account_sections(fallback_limit: int) -> None:
+    """Print a one-line-per-account summary of CCS 5-hour windows.
+
+    Each account's own detected limit is shown inline along with its
+    provenance (e.g. "detected from 12 hits over 14d"). When no history has
+    accumulated yet the fallback ``fallback_limit`` is used and labelled as
+    such — no false precision.
+    """
+    from ralph.limit_detector import detect_limit
+    from ralph.meters import ccs_projects_dir, discover_ccs_accounts
+    from ralph.usage import get_5hour_window_usage
+
+    accounts = discover_ccs_accounts()
+    if not accounts:
+        return
+
+    console.print()
+    console.print("[bold]CCS accounts (5-hour window)[/bold]")
+    for account in accounts:
+        root = ccs_projects_dir(account)
+        try:
+            agg = get_5hour_window_usage(claude_dir=root)
+        except Exception:
+            console.print(f"  [dim]{account}: (unavailable)[/dim]")
+            continue
+
+        detected = detect_limit(root, default=fallback_limit)
+        used = agg.rate_limited_tokens
+        limit = detected.value
+        pct = (used / limit * 100) if limit > 0 else 0.0
+        color = "red" if pct >= 90 else "yellow" if pct >= 70 else "green"
+
+        # Honest display: P90 is the number we pace against, but show the max
+        # observed window as context. Users with bursty usage (one big spike,
+        # lots of small ones) will see max ≫ P90 and know our detected limit
+        # is on the conservative side.
+        if detected.is_empirical and detected.max_observed > detected.value:
+            limit_label = (
+                f"{_fmt_tokens(limit)} (P90) — max {_fmt_tokens(detected.max_observed)}"
+            )
+        else:
+            limit_label = _fmt_tokens(limit)
+
+        console.print(
+            f"  [{color}]{account}[/{color}]: "
+            f"{used:>11,} tok  "
+            f"[dim]({pct:5.1f}% of {limit_label} — {detected.describe()})[/dim]"
+        )
+
+
+def _fmt_tokens(n: int) -> str:
+    """Compact token count: 1_200_000 -> '1.2M'."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
 
 
 if __name__ == "__main__":

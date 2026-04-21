@@ -376,7 +376,8 @@ class TestToolEnum:
         assert "ccs" in tools
 
     def test_ccs_dispatch_defaults_include_dangerously_skip_permissions_and_print(self):
-        """By default ccs invocations pass --dangerously-skip-permissions --print through."""
+        """By default ccs invocations pass --dangerously-skip-permissions --print through,
+        plus the stream-json flags Ralph needs for usage parsing."""
         with patch("ralph.process.stream_process") as mock_stream:
             run_tool_with_prompt(Tool.CCS, "hello world")
 
@@ -386,6 +387,8 @@ class TestToolEnum:
             "ccs",
             "--dangerously-skip-permissions",
             "--print",
+            "--output-format=stream-json",
+            "--verbose",
             "hello world",
         ]
         assert kwargs["input_text"] is None

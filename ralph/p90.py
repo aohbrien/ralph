@@ -17,13 +17,23 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ralph.usage import UsageAggregate
 
-# Common token limits across Claude plans
-# Used to detect when a user "hit" their limit
+# Common token limits across Claude plans. Used by ``_did_hit_limit`` to
+# filter "this window looks like it pushed against a cap" from "this was a
+# small test run". Each value is a ceiling we expect some user to be near.
+# Anything ≥ 95% of any entry counts as a hit; extending the list *upward*
+# only affects which big windows we'd consider — safe to over-include.
+#
+# The top two are speculative (no public Anthropic tier matches them yet) and
+# exist as forward-cover: observations of 14M+ 5-hour windows have been seen
+# in the wild via CCS multi-account setups, so the biggest cap we need to
+# register as "hit" is higher than Max-20x's 6M.
 COMMON_TOKEN_LIMITS: tuple[int, ...] = (
-    30_000,      # Free tier estimate
-    300_000,     # Pro tier
-    1_500_000,   # Max 5x
-    6_000_000,   # Max 20x
+    30_000,       # Free tier estimate
+    300_000,      # Pro tier
+    1_500_000,    # Max 5x
+    6_000_000,    # Max 20x
+    15_000_000,   # speculative higher tier / multi-account aggregates
+    30_000_000,   # forward cover
 )
 
 # Threshold for detecting a "limit hit" (95% of limit)

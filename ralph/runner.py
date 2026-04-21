@@ -49,11 +49,14 @@ from ralph.dashboard.reporter import (
     InstanceMetadata,
     NULL_REPORTER,
 )
+from ralph.meters import BucketRegistry, MeterIdentity, usage_roots
 from ralph.prd import PRD, UserStory
 from ralph.process import ManagedProcess, ProcessResult, Tool, run_tool_with_prompt
 from ralph.session import SessionManager, get_budget_for_session, update_heartbeat
 from ralph.state import RunState, clear_state, load_state, save_state
 from ralph.tasks import get_all_tasks_for_project, ClaudeTask
+from ralph.usage import UsageRecord
+from ralph.usage_stream import StreamUsageParser
 
 
 DEFAULT_MAX_ITERATIONS = 10
@@ -106,6 +109,7 @@ class Runner:
         coding_timeout: float | None = DEFAULT_CODING_TIMEOUT,
         ccs_profile: str | None = None,
         ccs_args: str | None = None,
+        ccs_pool: list[str] | None = None,
     ):
         self.prd_path = prd_path
         self.tool = tool
@@ -138,9 +142,49 @@ class Runner:
         self.planning_timeout = planning_timeout
         self.coding_timeout = coding_timeout
 
-        # ccs-specific configuration (profile + passthrough args)
+        # ccs-specific configuration (profile + passthrough args + rotation pool)
         self.ccs_profile = ccs_profile
         self.ccs_args = ccs_args
+        self.ccs_pool = list(ccs_pool) if ccs_pool else None
+
+        # Multi-bucket usage accounting. Each (provider, account) gets its own
+        # Bucket with independent limit/percentage/forecast — this replaces the
+        # old single-bar view that silently reported 0% whenever CCS was in use
+        # (because it was reading ~/.claude/projects instead of the account's
+        # isolated home under ~/.ccs/instances/<account>/).
+        #
+        # Per-identity limits are auto-detected from each account's own history
+        # via ralph.limit_detector (P90 of recent 5h windows). An explicit
+        # --five-hour-limit override still wins for every bucket.
+        from ralph.limit_detector import detect_limit
+        from ralph.meters import DEFAULT_5H_LIMIT
+        effective_limit = self.five_hour_limit if self.five_hour_limit else DEFAULT_5H_LIMIT
+
+        def _limit_for(
+            identity: MeterIdentity, root: Path | None
+        ) -> tuple[int, str, int, int]:
+            if self.five_hour_limit is not None:
+                return (int(self.five_hour_limit), "override", 0, 0)
+            detected = detect_limit(root, default=effective_limit)
+            return (
+                detected.value,
+                detected.source,
+                detected.hit_count,
+                detected.max_observed,
+            )
+
+        self._bucket_registry = BucketRegistry(
+            roots=usage_roots(self.tool, self.ccs_profile, self.ccs_pool),
+            limit=effective_limit,
+            limit_for=_limit_for,
+        )
+        # The identity currently being drawn from (set per-iteration, possibly
+        # rotated by _pick_pool_account). Stream records are attributed to it.
+        self._active_identity: MeterIdentity | None = self._default_active_identity()
+
+        # Current stream parser (stored so the runner can flush() after each
+        # run_tool_with_prompt call completes).
+        self._current_parser: StreamUsageParser | None = None
 
         # Track last pacing multiplier to only log changes
         self._last_pacing_multiplier: float = 1.0
@@ -344,22 +388,83 @@ Ralph provides these commands to manage PRD state:
             self._run_state.update(iteration, story_id)
         save_state(self.base_dir, self._run_state)
 
-    def _create_output_handler(self) -> Callable[[str], None]:
-        """Create a handler for streaming output."""
+    def _create_output_handler(self, tool: Tool | None = None) -> Callable[[str], None]:
+        """Create a handler for streaming output.
+
+        Feeds the raw PTY stream through a StreamUsageParser so that:
+          - Human-readable text extracted from NDJSON reaches the user and
+            the dashboard tail (not the raw JSON chrome).
+          - Per-assistant-message token usage is captured into the runner's
+            BucketRegistry as it arrives, without waiting for a JSONL flush.
+
+        Non-JSON lines (spinners, banner headers, debug diagnostics) are passed
+        through to display verbatim — the parser is tolerant.
+        """
         import os
         reporter = self._reporter
-        def handler(text: str) -> None:
-            # Write directly to fd 2 (stderr) for unbuffered real-time output
-            # This bypasses Python's sys.stderr which can be buffered or intercepted by Rich/Typer
-            # This is equivalent to what `tee /dev/stderr` was doing before
+
+        def write_line(text: str) -> None:
+            # Unbuffered real-time output. Bypasses sys.stderr (Rich/Typer may buffer).
             os.write(2, text.encode())
-            # Tee to the dashboard tail. The reporter is thread-safe and no-ops
-            # when nothing has called start() yet.
             try:
                 reporter.on_output_line(text)
             except Exception:
                 pass
+
+        parser = StreamUsageParser(
+            tool=tool or self.tool,
+            on_record=self._on_stream_record,
+            on_display=write_line,
+        )
+        # Stash for flush() after the process exits.
+        self._current_parser = parser
+
+        def handler(text: str) -> None:
+            parser.feed(text)
+
         return handler
+
+    def _on_stream_record(self, record: UsageRecord) -> None:
+        """Route a live-stream UsageRecord to the current iteration's active
+        bucket. Silently discards if the runner has no registry configured
+        (e.g., usage tracking is off)."""
+        registry = getattr(self, "_bucket_registry", None)
+        if registry is None:
+            return
+        identity = getattr(self, "_active_identity", None)
+        if identity is None:
+            return
+        try:
+            registry.add_stream_record(identity, record)
+        except Exception:
+            logger.debug("Failed to record stream usage", exc_info=True)
+
+    def _flush_parser(self) -> None:
+        """Drain any partial line buffered in the current parser."""
+        parser = getattr(self, "_current_parser", None)
+        if parser is not None:
+            try:
+                parser.flush()
+            except Exception:
+                logger.debug("parser.flush() failed", exc_info=True)
+
+    def _default_active_identity(self) -> MeterIdentity | None:
+        """Pick the default identity for stream-record attribution.
+
+        Pool runs start on the first pool member; single-profile runs pin to
+        that profile; host-claude runs have no account qualifier.
+        """
+        if self.tool == Tool.CCS:
+            if self.ccs_pool:
+                return MeterIdentity(provider="anthropic", account=self.ccs_pool[0])
+            if self.ccs_profile:
+                return MeterIdentity(provider="anthropic", account=self.ccs_profile)
+            # No profile + no pool — records go to a generic anthropic bucket
+            return MeterIdentity(provider="anthropic")
+        if self.tool == Tool.CLAUDE:
+            return MeterIdentity(provider="anthropic")
+        # amp/opencode: stream-only identity, no account qualifier
+        return MeterIdentity(provider=self.tool.value)
 
     def _display_tasks(self) -> None:
         """Display Claude tasks if watch_tasks is enabled."""
@@ -580,91 +685,140 @@ Ralph provides these commands to manage PRD state:
         """
         return float(RETRY_BACKOFF_BASE * (3 ** (attempt - 1)))
 
-    def _get_usage_percentage(self) -> float | None:
+    def _effective_limit(self) -> int:
+        """Resolve the 5-hour limit from CLI override, config, or the default."""
+        if self.five_hour_limit is not None:
+            return int(self.five_hour_limit)
+        from ralph.config import get_plan, get_plan_limits
+        current_plan = get_plan()
+        limits = get_plan_limits(current_plan)
+        return int(limits["5hour_tokens"])
+
+    def _snapshot_buckets(self) -> list[Any]:
+        """Snapshot the bucket registry, with a fallback if it isn't ready."""
+        try:
+            return self._bucket_registry.snapshot(active=self._active_identity)
+        except Exception:
+            logger.debug("bucket registry snapshot failed", exc_info=True)
+            return []
+
+    def _rotate_pool_account(self, iteration: int) -> None:
+        """If --ccs-pool is configured, pick the least-loaded account for this
+        iteration and publish a claim so peer Ralph instances don't hotspot.
+
+        No-op when no pool is configured.
         """
-        Get the current 5-hour window usage percentage.
+        if not self.ccs_pool or self.tool != Tool.CCS:
+            return
 
-        When cross-session coordination is enabled, this calculates the
-        percentage based on this session's share of the remaining budget.
+        try:
+            buckets = self._snapshot_buckets()
+            headroom: dict[str, int] = {}
+            iter_estimates: dict[str, int] = {}
+            for b in buckets:
+                if b.identity.account is None or b.identity.account not in self.ccs_pool:
+                    continue
+                headroom[b.identity.account] = max(0, b.limit - b.tokens_used)
+            for account in self.ccs_pool:
+                headroom.setdefault(account, self._bucket_registry.limit)
 
-        Returns:
-            Usage percentage (0-100), or None if usage tracking is unavailable.
+            from ralph.session import pick_least_loaded_account, set_session_claim
+
+            picked = pick_least_loaded_account(self.ccs_pool, headroom)
+            if picked is None:
+                return
+
+            self.ccs_profile = picked
+            self._active_identity = MeterIdentity(provider="anthropic", account=picked)
+
+            # Publish a claim so peer Ralph instances see our in-flight load.
+            # We use ESTIMATED_TOKENS_PER_ITERATION (50k) as the initial
+            # estimate; future iterations will use the forecaster's actual EMA.
+            from ralph.usage import ESTIMATED_TOKENS_PER_ITERATION
+            fc = self._bucket_registry._forecasters.get(self._active_identity)
+            iter_est = (
+                int(fc.value) if fc is not None and fc.value is not None
+                else ESTIMATED_TOKENS_PER_ITERATION
+            )
+            claim_duration = float((self.timeout or DEFAULT_TIMEOUT) + 60.0)
+            set_session_claim(
+                active_account=picked,
+                iter_estimate_tokens=iter_est,
+                claim_duration_seconds=claim_duration,
+            )
+
+            if self.verbose:
+                print_info(
+                    f"Pool rotation: iteration {iteration} → account '{picked}' "
+                    f"(~{iter_est:,} tok est, {headroom.get(picked, 0):,} headroom)"
+                )
+        except Exception:
+            logger.debug("pool rotation failed", exc_info=True)
+
+    def _finalize_iteration_buckets(self) -> None:
+        """Close the iteration: roll per-identity totals into forecasters and
+        release any account claim held for peer coordination."""
+        try:
+            self._bucket_registry.close_iteration()
+        except Exception:
+            logger.debug("close_iteration failed", exc_info=True)
+
+        if self.ccs_pool:
+            try:
+                from ralph.session import clear_session_claim
+                clear_session_claim()
+            except Exception:
+                logger.debug("clear_session_claim failed", exc_info=True)
+
+    def _get_usage_percentage(self) -> float | None:
+        """Current usage percentage across all configured buckets.
+
+        The pacer keys off the *hottest* bucket: if any single account is at
+        85%, we pace as if we're at 85%, even if the average is lower. This is
+        the right signal because rate limits bind per-account, not per-average.
         """
         try:
-            logger.debug("Getting usage percentage...")
-            from ralph.config import get_plan, get_plan_limits
-            from ralph.usage import get_5hour_window_usage
-
-            # Get the limit to use
-            if self.five_hour_limit is not None:
-                limit = self.five_hour_limit
-            else:
-                current_plan = get_plan()
-                limits = get_plan_limits(current_plan)
-                limit = limits["5hour_tokens"]
-
-            if limit <= 0:
-                logger.debug("Limit is 0, returning None")
+            buckets = self._snapshot_buckets()
+            if not buckets:
                 return None
-
-            logger.debug("Fetching 5-hour window usage...")
-            usage = get_5hour_window_usage()
-            total_used = usage.rate_limited_tokens  # Excludes cache reads
-            logger.debug(f"Total used: {total_used} tokens")
-
-            # Calculate remaining budget and divide across active sessions
-            remaining = max(0, limit - total_used)
-            logger.debug("Getting session budget...")
-            session_budget, num_sessions = get_budget_for_session(remaining)
-            logger.debug(f"Session budget: {session_budget}, num_sessions: {num_sessions}")
-
-            # Calculate this session's effective limit (used + session share of remaining)
-            # This ensures each session sees their fair share of the remaining budget
-            effective_limit = total_used + session_budget
-
-            if effective_limit <= 0:
-                return 100.0  # Fully used
-
-            # Calculate percentage based on effective limit
-            percentage = (total_used / effective_limit) * 100
-            logger.debug(f"Usage percentage: {percentage:.1f}%")
-            return min(percentage, 100.0)
+            return float(max(b.percentage for b in buckets))
         except Exception as e:
-            # If usage tracking fails, don't block the run
             logger.debug(f"Usage tracking failed: {e}")
             return None
 
     def _build_usage_snapshot(self) -> dict[str, Any]:
-        """Compact usage summary for the dashboard. Swallows any failure — the
-        dashboard is strictly informational and must never break the run."""
+        """Compact usage summary for the dashboard.
+
+        Returns a dict with:
+          - ``buckets``: list of per-identity Bucket snapshots (the new shape)
+          - ``tokens_used``, ``percentage``, ``five_hour_limit``, etc.: populated
+            from the hottest bucket for backward-compat with older dashboard
+            readers that only understand the single-bar schema.
+
+        Swallows all errors — the dashboard is informational.
+        """
         try:
-            from ralph.config import get_plan, get_plan_limits
-            from ralph.usage import get_5hour_window_usage
+            buckets = self._snapshot_buckets()
+            bucket_dicts = [b.to_dict() for b in buckets]
+            limit = self._effective_limit()
+            if not buckets:
+                return {"buckets": bucket_dicts, "five_hour_limit": limit}
 
-            if self.five_hour_limit is not None:
-                limit = self.five_hour_limit
-            else:
-                current_plan = get_plan()
-                limits = get_plan_limits(current_plan)
-                limit = limits["5hour_tokens"]
-
-            if limit <= 0:
-                return {}
-
-            usage = get_5hour_window_usage()
-            total_used = usage.rate_limited_tokens
-            remaining = max(0, limit - total_used)
+            # Pick the hottest bucket for legacy flat fields.
+            hottest = max(buckets, key=lambda b: b.percentage)
+            remaining = max(0, hottest.limit - hottest.tokens_used)
             session_budget, num_sessions = get_budget_for_session(remaining)
-            effective_limit = max(1, total_used + session_budget)
-            percentage = min(100.0, (total_used / effective_limit) * 100)
             return {
-                "tokens_used": total_used,
-                "five_hour_limit": limit,
+                "buckets": bucket_dicts,
+                "tokens_used": hottest.tokens_used,
+                "five_hour_limit": hottest.limit,
                 "allocated_budget": session_budget,
                 "num_sessions": num_sessions,
-                "percentage": percentage,
+                "percentage": hottest.percentage,
+                "hottest_identity": hottest.identity.label,
             }
         except Exception:
+            logger.debug("build_usage_snapshot failed", exc_info=True)
             return {}
 
     def _calculate_adaptive_delay(self, usage_percentage: float | None) -> tuple[float, float]:
@@ -732,63 +886,71 @@ Ralph provides these commands to manage PRD state:
         - Time until window resets in warnings
         """
         try:
-            from datetime import timedelta
+            from datetime import datetime, timezone
 
-            from ralph.config import get_plan, get_plan_limits, load_config
-            from ralph.console import _format_time_remaining
-            from ralph.usage import get_5hour_window_usage
+            from ralph.config import load_config
 
-            # Get config to check if cost tracking is enabled
             config = load_config()
             show_cost = config.enable_cost_tracking
 
-            # Get the limit to use
-            if self.five_hour_limit is not None:
-                limit = self.five_hour_limit
-            else:
-                current_plan = get_plan()
-                limits = get_plan_limits(current_plan)
-                limit = limits["5hour_tokens"]
-
-            if limit <= 0:
+            buckets = self._snapshot_buckets()
+            if not buckets:
                 return
 
-            usage = get_5hour_window_usage()
-            total_used = usage.rate_limited_tokens  # Excludes cache reads
-            percentage = (total_used / limit * 100) if limit > 0 else 0
-
-            # Get cost for display if enabled
-            cost_usd = usage.cost_usd if show_cost else None
-
-            # Always display brief usage summary after each iteration
-            print_iteration_usage(percentage, total_used, limit, cost_usd=cost_usd)
-
-            # Calculate time until oldest data ages out of the 5-hour window
-            from datetime import datetime, timezone
-
             now = datetime.now(timezone.utc)
-            time_remaining = usage.time_until_oldest_ages_out(timedelta(hours=5), now)
+            hottest = max(buckets, key=lambda b: b.percentage)
+            cost_usd = hottest.cost_usd if show_cost else None
 
-            # Format time remaining
-            if time_remaining.total_seconds() <= 0:
-                time_until_reset = "now"
+            # Multi-bucket runs (e.g. --ccs-pool, or discovered CCS accounts)
+            # print one line per bucket so the user sees per-account state; the
+            # existing single-bar UI is preserved for everyone else.
+            if len(buckets) > 1:
+                for b in buckets:
+                    b_cost = b.cost_usd if show_cost else None
+                    suffix = " ← active" if b.is_active else ""
+                    print_iteration_usage(
+                        b.percentage,
+                        b.tokens_used,
+                        b.limit,
+                        cost_usd=b_cost,
+                    )
+                    if suffix and self.verbose:
+                        print_info(f"{b.identity.label}{suffix}")
             else:
-                hours = int(time_remaining.total_seconds() // 3600)
-                minutes = int((time_remaining.total_seconds() % 3600) // 60)
-                if hours > 0:
-                    time_until_reset = f"{hours}h {minutes}m"
-                else:
-                    time_until_reset = f"{minutes}m"
+                print_iteration_usage(
+                    hottest.percentage,
+                    hottest.tokens_used,
+                    hottest.limit,
+                    cost_usd=cost_usd,
+                )
 
-            # Show warning banners based on thresholds
-            if percentage >= 90:
-                print_usage_critical(percentage, total_used, limit, time_until_reset)
-            elif percentage >= 70:
-                print_usage_warning(percentage, total_used, limit, time_until_reset)
+            # Warning banners use the hottest bucket's window-reset time.
+            if hottest.resets_at is not None:
+                remaining = hottest.resets_at - now
+                total_s = max(0.0, remaining.total_seconds())
+                h = int(total_s // 3600)
+                m = int((total_s % 3600) // 60)
+                time_until_reset = f"{h}h {m}m" if h > 0 else f"{m}m"
+            else:
+                time_until_reset = "unknown"
+
+            if hottest.percentage >= 90:
+                print_usage_critical(
+                    hottest.percentage,
+                    hottest.tokens_used,
+                    hottest.limit,
+                    time_until_reset,
+                )
+            elif hottest.percentage >= 70:
+                print_usage_warning(
+                    hottest.percentage,
+                    hottest.tokens_used,
+                    hottest.limit,
+                    time_until_reset,
+                )
 
         except Exception:
-            # If usage tracking fails, don't block the run
-            pass
+            logger.debug("display_iteration_usage failed", exc_info=True)
 
     def run_iteration(self, iteration: int) -> tuple[ProcessResult, str | None]:
         """
@@ -1194,8 +1356,19 @@ Ralph provides these commands to manage PRD state:
                     print_interrupt(iteration, completed, total)
                     return 130
 
+            # If --ccs-pool is configured, pick the least-loaded account for
+            # this iteration *before* the tool is invoked so the profile + the
+            # parser's active-identity attribution line up.
+            self._rotate_pool_account(iteration)
+
             # Run iteration with retry logic
             result, story_id = self._run_iteration_with_retry(iteration)
+
+            # Roll up this iteration's per-identity token totals into
+            # forecasters, and release any peer-coordination claim. Must happen
+            # before _build_usage_snapshot so the dashboard sees the new
+            # forecast values for this iteration.
+            self._finalize_iteration_buckets()
 
             # Check for interrupt after iteration - do this FIRST before any slow operations
             if self._interrupted or result.interrupted:
@@ -1312,6 +1485,7 @@ def run_ralph(
     coding_timeout: float | None = DEFAULT_CODING_TIMEOUT,
     ccs_profile: str | None = None,
     ccs_args: str | None = None,
+    ccs_pool: list[str] | None = None,
 ) -> bool | int:
     """
     Convenience function to run Ralph.
@@ -1373,5 +1547,6 @@ def run_ralph(
         coding_timeout=coding_timeout,
         ccs_profile=ccs_profile,
         ccs_args=ccs_args,
+        ccs_pool=ccs_pool,
     )
     return runner.run()

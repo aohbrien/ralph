@@ -407,7 +407,13 @@ def run_tool(
 # profile. Account instances created via `ccs auth create` work with --print but
 # NOT with -p. Because ccs forwards unknown flags to the underlying CLI, this
 # works uniformly for account profiles, OAuth providers, and other runtimes.
-DEFAULT_CCS_ARGS = "--dangerously-skip-permissions --print"
+#
+# `--output-format=stream-json --verbose` puts claude into NDJSON mode so
+# Ralph's StreamUsageParser can extract exact per-message token usage from
+# stdout. Users who want plain text output can override with `--ccs-args`.
+DEFAULT_CCS_ARGS = (
+    "--dangerously-skip-permissions --print --output-format=stream-json --verbose"
+)
 
 
 def run_tool_with_prompt(
@@ -439,14 +445,25 @@ def run_tool_with_prompt(
         ProcessResult with output and completion status
     """
     if tool == Tool.CLAUDE:
-        cmd = ["claude", "--dangerously-skip-permissions", "--print"]
+        # stream-json + --verbose emit Anthropic usage blocks as NDJSON on stdout,
+        # which StreamUsageParser consumes for exact per-iteration accounting.
+        cmd = [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--print",
+            "--output-format=stream-json",
+            "--verbose",
+        ]
         input_text: str | None = prompt
     elif tool == Tool.AMP:
-        cmd = ["amp", "--dangerously-allow-all"]
+        # --stream-json puts amp in NDJSON mode with the same Anthropic usage
+        # shape as claude, so the same parser works for both.
+        cmd = ["amp", "--dangerously-allow-all", "--stream-json"]
         input_text = prompt
     elif tool == Tool.OPENCODE:
-        # OpenCode uses -p flag for prompt, -q for quiet/non-interactive
-        cmd = ["opencode", "-p", prompt, "-q"]
+        # `opencode run --format json` emits AI-SDK NDJSON events including
+        # per-step usage. Replaces the old `opencode -p <prompt> -q` invocation.
+        cmd = ["opencode", "run", "--format", "json", prompt]
         input_text = None  # Don't use stdin
     elif tool == Tool.CCS:
         # ccs syntax: `ccs [profile] [passthrough args...] [prompt]`.
